@@ -15,8 +15,6 @@ from tqdm import tqdm
 from PIL import Image
 
 # VLLM & Transformers
-from vllm import LLM, SamplingParams
-from transformers import AutoProcessor
 from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 
 def configure_runtime_env(
@@ -33,56 +31,7 @@ def configure_runtime_env(
 # Configuration & Prompt
 # -----------------------------
 
-SYSTEM_PROMPT = """
-You are a rigorous, impartial vision evaluator for robot task progress. Your job is to judge whether the AFTER image set moves closer to the task objective than the BEFORE image set, using the provided reference examples only as anchors.
-
-<Task>
-`{task}`
-
-REFERENCE EXAMPLES (for visual anchoring only; not necessarily this run's actual START/END):
-- REFERENCE START — Robot Front Image (task just starting): <image>
-- REFERENCE END — Robot Front Image (task fully completed): <image>
-</Task>
-
-BEFORE Robot Front Image: <image>
-BEFORE Robot Left Wrist Image: <image>
-BEFORE Robot Right Wrist Image: <image>
-
-AFTER Robot Front Image: <image>
-AFTER Robot Left Wrist Image: <image>
-AFTER Robot Right Wrist Image: <image>
-
-Goal
-Compare the BEFORE and AFTER three-view sets and judge whether AFTER moves closer to accomplishing the task than BEFORE, using the REFERENCE START/END images as conceptual anchors.
-
-Progress Estimation (no formulas)
-1) Calibrate using the references:
-   - REFERENCE START = “just beginning”; REFERENCE END = “fully completed.”
-   - Visually estimate how far BEFORE and AFTER are along this START→END continuum.
-2) Direction:
-   - AFTER better than BEFORE → positive score.
-   - AFTER worse than BEFORE → negative score.
-   - Essentially the same → 0.
-3) Normalize to an integer percentage in [-100%, +100%]:
-   - For improvements, scale the improvement relative to what remained from BEFORE to END.
-   - For regressions, scale the deterioration relative to how far BEFORE had progressed from START.
-   - Clip to [-100%, +100%] and round to the nearest integer percent.
-
-Evaluation Criteria (apply across all three views)
-1) Task Alignment: Evidence directly tied to `{task}`.
-2) Completeness & Accuracy: Correct pose, contact, placement, orientation, grasp quality, absence of collisions, stability, etc.
-3) View-Specific Evidence & Consistency:
-   - Use the **Front** view for global layout, object pose, approach path, end-state geometry, and scene-level constraints.
-   - Use the **Left/Right Wrist** views to inspect **fine-grained gripper state** (finger closure, contact location/area, slippage, wedge/misalignment, object deformation, cable/wire/cloth entanglement, unintended contact, occluded collisions).
-   - When views disagree, prioritize the view that provides **decisive cues** for the criterion at hand. In particular, wrist views often **override** for grasp/contact validity and safety.
-   - If any single view shows a failure that invalidates success (e.g., mis-grasp, collision, unsafe/unstable pose), let that override when judging progress.
-4) Ignore Irrelevant Factors: Lighting, color shifts, background clutter, or UI/watermarks that don't affect task success.
-5) Ambiguity: If evidence is genuinely inconclusive or conflicting without decisive cues, treat progress as unchanged → 0%.
-
-Output Format (STRICT)
-Return ONLY one line containing the score wrapped in <score> tags, as an integer percentage with a percent sign:
-<score>+NN%</score>  or  <score>-NN%</score>  or  <score>0%</score>
-"""
+from grm_runtime.prompt import SYSTEM_PROMPT
 
 # -----------------------------
 # File & Video Utilities
@@ -444,8 +393,29 @@ class GRMInference:
         max_pixels=76800,
         local_rank: str | None = None,
         cuda_visible_devices: str | None = None,
+        engine: str = "vllm",
+        steering_config: str | None = None,
+        device: str = "cuda:0",
+        max_new_tokens: int = 64,
     ):
         configure_runtime_env(local_rank, cuda_visible_devices)
+        self.engine = engine
+        self.backend = None
+        if engine == "hf":
+            from grm_runtime.hf_backend import HFBackend
+            self.backend = HFBackend(model_path, steering_config=steering_config, device=device,
+                min_pixels=min_pixels, max_pixels=max_pixels, max_new_tokens=max_new_tokens)
+            self.model = self.backend.model
+            self.processor = self.backend.processor
+            return
+        if engine != "vllm":
+            raise ValueError("engine must be vllm or hf")
+        if steering_config:
+            from grm_runtime.config import load_steering
+            if load_steering(steering_config)["enabled"]:
+                raise ValueError("Attention steering requires engine=hf")
+        from vllm import LLM, SamplingParams
+        from transformers import AutoProcessor
         print(f"Loading model from {model_path} ...")
 
         self.model = LLM(
@@ -467,6 +437,8 @@ class GRMInference:
             self.processor.image_processor.min_pixels = min_pixels
 
     def inference_batch(self, batch_data: List[Dict]) -> List[Dict]:
+        if self.backend is not None:
+            return self.backend.inference_batch(batch_data)
         prompts = []
         for item in batch_data:
             images = [Image.open(p).convert("RGB") for p in item["image"]]
@@ -577,6 +549,8 @@ class GRMInference:
 
         # Build Samples based on Mode
         samples = build_samples_json(run_root, task, indices, ref_end_path_str, mode=eval_mode)
+        for sample in samples:
+            sample["eval_mode"] = eval_mode
         json_path = run_root / "sample.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(samples, f, indent=2)
@@ -593,6 +567,8 @@ class GRMInference:
         
         for idx, item in enumerate(results):
             raw = item.get("pred", "")
+            if self.engine == "hf" and not item.get("valid", False):
+                raise ValueError(f"Invalid HF prediction at sample {idx}: {raw}")
             try:
                 val_str = raw.split("<score>")[-1].split("</score>")[0].replace("%", "").strip()
                 raw_score = max(-100.0, min(100.0, float(val_str))) / 100.0

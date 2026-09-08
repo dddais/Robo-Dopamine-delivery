@@ -11,6 +11,10 @@ MONITOR_STATUS_SUCCESS = "success"
 MONITOR_STATUS_FAIL = "failed"
 
 
+class MonitorConflict(ValueError):
+    """An existing monitor ID was reused with different start parameters."""
+
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -103,4 +107,3 @@ class MonitorSession:
             "poll_count": self.poll_count,
             "result": self.result,
         }
-

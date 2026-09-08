@@ -1,0 +1,13 @@
+model_path: /home/dais/workspace/Robo-Dopamine/pretrained_models/Robo-Dopamine-GRM-2.0-8B-Preview
+data_dir: ../examples/demo_table
+output_root: ../results/offline_steering
+task: organize the table
+target_queries: [red can]
+goal_image: ../examples/demo_table/goal_image.png
+frame_interval: 20
+modes: [forward, incremental, backward]
+conditions: [baseline, candidate_target, candidate_wrong, low_rank_target]
+steering_config: ./steering.yaml
+device: cuda:0
+max_new_tokens: 64
+visualize: true

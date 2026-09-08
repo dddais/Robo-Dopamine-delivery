@@ -1,5 +1,9 @@
 # Robo-Dopamine Monitor 说明
 
+在线接入优先阅读 [在线任务进度监控：实现、接口与用法](docs/online_attention_steering.md)，覆盖当前 GRM/HF/SAM3 流程、HTTP 字段、客户端示例与生命周期。
+
+Attention steering 的新增离线/在线流程、SAM3 启动方式和验证结果见 [README_steering.md](README_steering.md)。
+
 本文档面向当前仓库的 monitor / GRM 使用，重点说明离线进度评分、HTTP monitor 服务、配置方式、代码结构和可扩展点。文档只描述当前代码中已经存在并可直接定位的入口。
 
 原仓库完整 README 见 [README.md](README.md)。本文档只补充 monitor 相关流程。

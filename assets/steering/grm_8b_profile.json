@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "model_path": "/home/dais/workspace/Robo-Dopamine/pretrained_models/Robo-Dopamine-GRM-2.0-8B-Preview",
+  "model_config_sha256": "5cd452860dc1e9c29dd71cc3cef7f39b338b7a40793f7a260655c2d3568f3661",
+  "num_layers": 36,
+  "num_heads": 32,
+  "ranking_path": "grm_rawmean12_consensus.json",
+  "skip_early_layers": 2,
+  "top_k": 8,
+  "bias": 6.0,
+  "query_scope": "all",
+  "negative_scope": "target_span",
+  "intervention_labels": [
+    "after_cam_high"
+  ],
+  "protocol": "GRM eight-image raw-mean-12 / three-task normalized Borda",
+  "calibrated_modes": [
+    "forward"
+  ],
+  "source_record": "/home/dais/workspace/Robo-Dopamine/mydata_bench/attention_steering_exp_record.md",
+  "status": "exploratory; other modes require validation"
+}

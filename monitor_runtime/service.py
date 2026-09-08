@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """HTTP monitor service implementing the Robot Runtime monitor contract.
 
-This is a lightweight service skeleton. It provides the stable distributed
-interface now; the GRM backend can later replace ``DeterministicMonitorBackend``
-without changing the robot runtime or MCP adapter.
+Serves deterministic connectivity checks or background GRM inference. The GRM
+backend supports the original vLLM engine and the HF attention steering engine.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from monitor_runtime.core import MONITOR_STATUS_FAIL, MONITOR_STATUS_RUNNING, MONITOR_STATUS_SUCCESS, MonitorSession
+from monitor_runtime.core import MONITOR_STATUS_FAIL, MONITOR_STATUS_RUNNING, MONITOR_STATUS_SUCCESS, MonitorSession, MonitorConflict
 
 DEFAULT_GRM_MODEL_PATH = (
     "/home/ubuntu/dais/Robo-dopamine/pretrained_models/"
@@ -178,7 +177,15 @@ def create_app(backend: DeterministicMonitorBackend | None = None) -> "FastAPI":
     from starlette.concurrency import run_in_threadpool
 
     backend = backend or DeterministicMonitorBackend()
-    app = FastAPI(title="Robo-Dopamine Monitor Service")
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        if hasattr(backend, "close"):
+            await run_in_threadpool(backend.close)
+
+    app = FastAPI(title="Robo-Dopamine Monitor Service", lifespan=lifespan)
 
     @app.get("/health")
     async def health():
@@ -188,8 +195,22 @@ def create_app(backend: DeterministicMonitorBackend | None = None) -> "FastAPI":
     async def monitors_start(body: dict[str, Any]):
         try:
             session = await run_in_threadpool(backend.start, body)
+        except MonitorConflict as exc:
+            return _fail(str(exc), status=409)
         except ValueError as exc:
             return _fail(str(exc), status=400)
+        return _ok(session.to_dict())
+
+    @app.post("/monitors/activate")
+    async def monitors_activate(body: dict[str, Any]):
+        if not hasattr(backend, "activate"):
+            return _fail("backend does not support deferred inference", status=400)
+        try:
+            session = await run_in_threadpool(backend.activate, body)
+        except KeyError as exc:
+            return _fail(str(exc), status=404)
+        except ValueError as exc:
+            return _fail(str(exc), status=409)
         return _ok(session.to_dict())
 
     @app.post("/monitors/status")
@@ -256,6 +277,12 @@ def _build_argparser(config: dict[str, Any]) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Robo-Dopamine monitor service")
     parser.add_argument("--host", default=cfg("host", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=cfg("port", 8877))
+    parser.add_argument("--inference-engine", choices=("vllm", "hf"), default=cfg("inference_engine", "vllm"))
+    parser.add_argument("--steering-config", default=cfg("steering_config", None))
+    parser.add_argument("--device", default=cfg("device", "cuda:0"))
+    parser.add_argument("--max-new-tokens", type=int, default=cfg("max_new_tokens", 64))
+    parser.add_argument("--output-root", default=cfg("output_root", None))
+    parser.add_argument("--max-camera-skew-s", type=float, default=cfg("max_camera_skew_s", 0.25))
     parser.add_argument(
         "--backend",
         choices=("deterministic", "grm"),
@@ -301,6 +328,8 @@ def _build_argparser(config: dict[str, Any]) -> argparse.ArgumentParser:
         default=bool(cfg("no_backward", False)),
         help="Exclude backward mode from GRM inference and fused progress.",
     )
+    parser.add_argument("--backward", dest="no_backward", action="store_false", default=argparse.SUPPRESS,
+                        help="Enable backward mode, overriding no_backward in YAML.")
     parser.add_argument(
         "--success-threshold",
         type=float,
@@ -354,8 +383,17 @@ def main(argv: list[str] | None = None) -> int:
     pre.add_argument("--config", default=None)
     known, _remaining = pre.parse_known_args(argv)
     config = _load_config(known.config)
+    if known.config:
+        base = Path(known.config).expanduser().resolve().parent
+        from grm_runtime.common import resolve_path
+        for key in ("steering_config", "goal_image", "fisheye_config", "output_root"):
+            if config.get(key):
+                config[key] = resolve_path(config[key], base)
 
     parser = _build_argparser(config)
+    allowed = {action.dest for action in parser._actions}
+    if set(config) - allowed:
+        raise ValueError(f"Unknown monitor config keys: {sorted(set(config) - allowed)}")
     parser.add_argument(
         "--config",
         default=known.config,
@@ -394,6 +432,12 @@ def main(argv: list[str] | None = None) -> int:
             success_max_drift=args.success_max_drift,
             fail_stable_steps=args.fail_stable_steps,
             fail_min_progress=args.fail_min_progress,
+            inference_engine=args.inference_engine,
+            steering_config=args.steering_config,
+            device=args.device,
+            max_new_tokens=args.max_new_tokens,
+            output_root=args.output_root,
+            max_camera_skew_s=args.max_camera_skew_s,
         )
     else:
         observation_client = None

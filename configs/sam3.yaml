@@ -1,0 +1,6 @@
+host: 127.0.0.1
+port: 8878
+model_path: /home/dais/workspace/model/sam3
+device: cuda:0
+threshold: 0.3
+mask_threshold: 0.5

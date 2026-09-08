@@ -1,0 +1,15 @@
+# GRM raw-mean-12 three-task Borda, skip layers 0..1. Research profile, not a calibrated success classifier.
+enabled: true
+profile_path: ../assets/steering/grm_8b_profile.json
+top_k: 8
+bias: 6.0
+query_scope: all
+negative_scope: target_span
+intervention_labels: [after_cam_high]
+on_missing_bbox: baseline
+grounding:
+  url: http://127.0.0.1:8878
+  timeout_s: 30.0
+task_queries:
+  pick the carrot and put it on yellow plate: [carrot]
+  pick the white cube and put it on yellow plate: [white cube]

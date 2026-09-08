@@ -11,8 +11,8 @@
 host: 0.0.0.0
 port: 8877
 
-# determinism: 简单轮询后端, 不加载模型 (默认)
-# grm        : 在线 GRM 推理后端, 每次 poll 跑三模态融合
+# deterministic: 简单轮询后端, 不加载模型 (默认)
+# grm          : 后台持续 GRM 推理，poll 只读结果；steering 见 monitor_steering.yaml
 backend: grm
 
 # ---------------- Robot Runtime (图像源) ----------------
