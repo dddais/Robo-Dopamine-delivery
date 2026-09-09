@@ -228,6 +228,24 @@ class MonitorTests(unittest.TestCase):
         self.backend._snapshot_current=lambda *a,**kw:(duplicate,{'identity':'new'})
         self.assertIsNone(self.backend._run_one_step(self.state))
         self.assertEqual(self.state.step,1)
+    def test_preview_is_exact_committed_input_and_survives_stop(self):
+        record = self.backend._run_one_step(self.state)
+        frame_id = record['preview']['frame_set_id']
+        original = {camera: Path(path).read_bytes() for camera, path in record['frames'].items()}
+        self.current = self.make_images('next')
+        Image.new('RGB', (32,32), 'red').save(self.current['cam_high'])
+        self.backend._snapshot_current = lambda *a, **kw: (self.current, {'identity':'next'})
+        newer = self.backend._run_one_step(self.state)
+        self.assertNotEqual(newer['preview']['frame_set_id'], frame_id)
+        self.assertNotEqual(self.backend.frame_image(newer['preview']['frame_set_id'], 'cam_high'), original['cam_high'])
+        with TestClient(create_app(self.backend)) as client:
+            client.post('/monitors/stop', json={'monitor_id':'m'})
+            for camera, data in original.items():
+                response = client.get(f'/monitors/frames/{frame_id}/{camera}.png')
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.content, data)
+            self.assertEqual(client.get(f'/monitors/frames/{frame_id}/unknown.png').status_code, 404)
+            self.assertEqual(client.get('/monitors/frames/not-registered/cam_high.png').status_code, 404)
     def test_invalid_mode_never_partially_advances(self):
         def output(samples):
             return [{**samples[0],'pred':'<score>+20%</score>','valid':True},
@@ -236,12 +254,14 @@ class MonitorTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):self.backend._run_one_step(self.state)
         self.assertEqual(self.state.step,0);self.assertEqual(self.state.tracker.counts['forward'],0)
         self.assertEqual(self.state.previous,self.ref)
+        self.assertFalse(self.backend._preview_frames)
     def test_stop_during_generate_never_publishes(self):
         def output(samples):
             self.state.stop_event.set()
             return [{**s,'pred':'<score>+20%</score>','valid':True} for s in samples]
         self.model.inference_batch=output
         self.assertIsNone(self.backend._run_one_step(self.state));self.assertEqual(self.state.step,0)
+        self.assertFalse(self.backend._preview_frames)
     def test_idempotent_start_conflict_and_status_metadata(self):
         old=self.backend.status({'monitor_id':'m'})
         again=self.backend.start({'monitor_id':'m','execution_id':'e','subtask':'pick carrot'})

@@ -86,6 +86,59 @@ Monitor YAML 中的 `steering_config / goal_image / fisheye_config / output_root
 
 配置为进程级：在线 start 不接受模型、goal 图、head 列表、bias、对照条件或推理模式的动态覆盖。修改这些配置需要重启相应服务。当前 profile 针对 GRM-2.0-8B-Preview；4B/微调权重需要匹配的 ranking/profile，不能只替换模型路径。
 
+### 1.3 双分支监控
+
+双分支同时运行原始 GRM 和 attention steering GRM：从同一 checkpoint 各加载一个独立 HF 模型实例，每轮并发处理相同的冻结图像、任务、reference 和 previous。原始分支使用无干预的 HF greedy 推理；steering 分支按原配置定位目标并施加 attention bias。两分支的 incremental 进度分别累计。
+
+已有单分支配置默认行为不变。在原启动命令上增加参数即可启用：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m monitor_runtime.service \
+  --config configs/monitor_steering.yaml \
+  --dual-branch --baseline-device cuda:1 \
+  --progress-difference-threshold 0.20 --difference-mode absolute
+```
+
+也可使用独立示例 [monitor_dual_branch.yaml](../configs/monitor_dual_branch.yaml)，先修改其中的 Robot Runtime 地址，再运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m monitor_runtime.service \
+  --config configs/monitor_dual_branch.yaml
+```
+
+SAM3 仍按第 1.1 节单独启动。示例中 steering 使用可见 GPU 0、baseline 使用可见 GPU 1；若显存足够，可将 `--baseline-device cuda:0` 设为与 steering 相同的设备，仍加载两份独立模型。未配置 `baseline_device` 时默认跟随 `device`。每个模型仅在服务启动时加载一次，基线使用与 steering 相同的 checkpoint、预处理和生成长度；不使用 vLLM 采样作为对照，以免混入推理引擎和采样的差异。
+
+| monitor 字段 / CLI | 默认值 | 说明 |
+|---|---|---|
+| `dual_branch` / `--dual-branch` | `false` | 启用双分支；要求 `backend=grm`、`inference_engine=hf` 且 steering 配置启用；`--no-dual-branch` 可覆盖 YAML |
+| `baseline_device` / `--baseline-device` | 跟随 `device` | 原始 GRM 所在设备；双分支示例 YAML 为 `cuda:1` |
+| `progress_difference_threshold` / `--progress-difference-threshold` | `0.20` | 两分支融合进度差的失败阈值，有限数且在 `[0,1]`；0.20 为 20 个百分点，初始示例值需按任务调整 |
+| `difference_mode` / `--difference-mode` | `absolute` | `absolute`：绝对差；`baseline_minus_steering`：原始减 steering；`steering_minus_baseline`：steering 减原始 |
+
+start/status/stop 的请求格式不变，双分支配置同样为进程级。`GET /health` 的 `data.dual_branch` 返回是否启用、比较指标、方向、阈值及两分支设备。具体判定与结果字段见第 6.4 节和第 3.2 节。
+
+### 1.4 Robot Runtime 的 manual 操作台
+
+`dualsystem-agentic` 的 `/manual` 页面现在可展示三视角、SAM3 bbox 和本服务得分。
+每次成功提交评分时，`status.data.result.preview` 返回：
+
+```json
+{"frame_set_id":"<32位十六进制ID>","cameras":["cam_high","cam_left_wrist","cam_right_wrist"],"kind":"grm_after"}
+```
+
+`GET /monitors/frames/{frame_set_id}/{camera}.png` 返回该轮实际使用的当前视角 PNG，
+与 `result.frames` 指向文件的字节一致，含已配置的去畸变处理；不接受文件路径参数。
+图像和 `result.modes[mode].steering.grounding.after_<camera>` 的 bbox 属于同一轮
+推理。bbox 只由网页绘制，不写入模型输入 PNG。
+
+仅已提交的有效推理结果会发布图像 ID；失败或取消的推理不发布。服务保留最近
+128 组评分图像索引，stop 后仍可访问最终画面，索引淘汰或进程重启后返回 404。
+原始会话文件的保存方式不变。无 GRM 图像能力的 deterministic 后端返回 404。
+
+从臂 Runtime 通过已配置的 `monitor.url` 转发这些图像，浏览器无需直连服务器或
+额外开放端口。更新这项功能后重启 Monitor 即可，SAM3 接口与推理设置不变。
+网页目标输入和人工开始/停止/归位仍由 Runtime 与上游 loop 管理。
+
 ## 2. 上游接入示例
 
 ### 2.1 curl 最小调用
@@ -294,6 +347,10 @@ status 只读取最近已提交结果，不触发 GRM 推理，也不增加 `pol
 | `progress / fused / progress_percent / status` | 本轮融合结果；百分数为进度乘 100 |
 | `inference_updated_at / result_age_s` | 提交时间 / 距最后提交的秒数；首次提交前 age 从创建时间算 |
 | `modes.<mode>.score / progress / hop / pred` | 原始分数、模式累计值、变化量及模型输出文本 |
+| `branches.steering / branches.baseline` | 仅双分支存在；各含 `progress` 和 `modes`，保存各自融合进度、各模式分数和模型输出；顶层 `progress / modes` 继续对应 steering 分支 |
+| `comparison.metric / difference_mode / difference / threshold / threshold_exceeded` | 仅双分支存在；比较指标固定为 `fused_progress`，记录差值方向、当前差值、阈值及是否严格超过 |
+| `comparison.modes.<mode>.score_difference / progress_difference` | 仅双分支存在；按相同方向计算的各模式原始分数差和累计进度差，供诊断；终态规则使用融合进度差 |
+| `failure_reason` | 差值规则触发时为 `branch_difference_exceeded`；原有进度规则触发的终态不添加此字段 |
 | `modes.<mode>.steering.applied / degraded / reason` | 是否实际施加干预、是否降级、降级原因（有时才存在） |
 | `modes.<mode>.steering.grounding.<label>` | 对应图像的 SAM3 结果和客户端选择结果；网络请求失败时可能没有该条目 |
 | `modes.<mode>.steering.grounding.<label>.selected.bbox` | 选中目标的像素 `xyxy` 框；歧义/无检测时 `selected` 为 null |
@@ -307,7 +364,7 @@ status 只读取最近已提交结果，不触发 GRM 推理，也不增加 `pol
 | `latency_s` | 本轮耗时，秒；不含随后 interval 等待和客户端轮询延迟 |
 | `final_status / progress_history` | 终态时附加的状态与全部已提交融合进度 |
 
-`steering` 和 `grounding` 位于各个 `modes` 内，**没有顶层 `result.steering` 或 `result.grounding`**。`timing.grounding_ms / grm_ms` 汇总各模式耗时；`total_ms` 还包括采图、排队、预处理等，不要求等于这两项之和。
+`steering` 和 `grounding` 位于各个 `modes` 内，**没有顶层 `result.steering` 或 `result.grounding`**。`timing.grounding_ms / grm_ms` 汇总各模式耗时；双分支下汇总两个分支。`total_ms` 是本轮墙钟耗时，还包括采图、排队、预处理等；双分支并发时耗时之和可以大于 `total_ms`。
 
 ### 3.3 `POST /monitors/stop`
 
@@ -323,7 +380,7 @@ stop 保留日志和图片，不停止机器人。用相同外部 ID 重新 star
 
 ### 3.4 `GET /health`
 
-`data` 包含 `status / provider / model / runtime_url / engine / steering_enabled / profile_fingerprint / sessions / interval / active_modes / cameras`。`sessions` 包括尚未 stop 的终态会话，不等于正在执行模型推理的数量。
+`data` 包含 `status / provider / model / runtime_url / engine / steering_enabled / profile_fingerprint / dual_branch / sessions / interval / active_modes / cameras`。`sessions` 包括尚未 stop 的终态会话，不等于正在执行模型推理的数量。
 
 ### 3.5 `POST /monitors/activate`
 
@@ -422,13 +479,13 @@ print(result["selection_status"], result["selected"])
 1. `start()` 创建 `_SubtaskState`、UUID 目录、manifest 和后台线程；线程采集一次三路 reference，固定为当前会话起点。
 2. 每轮读取当前三路图像，保存到独立 `capture_<index>/`；重复 observation 删除本次快照并跳过。采图序号与成功推理轮数独立，因此目录编号可有间隔。
 3. `build_online_samples()` 为每个启用模式构造 8 图输入。所有模式都使用同一轮冻结 AFTER 图像。
-4. 获得共享推理锁，依次运行各模式的 SAM3 定位、bbox 到视觉 tokens 映射、HF attention bias 和生成。
-5. 校验所有输出的 ID、模式和分数，使用 tracker/state 副本计算结果。全部有效后，先追加 `online_pred.jsonl`，再在会话锁内一次性提交进度、previous、轮次和最近结果。
+4. 获得共享推理锁，依次运行各模式的 SAM3 定位、bbox 到视觉 tokens 映射、HF attention bias 和生成。双分支时，在此锁内并发运行两个独立模型；各分支内部仍依次处理模式，原始分支不请求 SAM3。
+5. 校验所有输出的 ID、对应模式和分数，使用 tracker/state 副本计算结果。双分支须全部通过校验，分别累计进度后比较差值。全部有效后，先追加 `online_pred.jsonl`，再在会话锁内一次性提交两分支进度、previous、轮次和最近结果。
 6. 等待 `interval` 秒，再采下一轮。到达终态后结束循环，终态结果仍能查询，直到显式 stop。
 
 任何模式失败都不会部分推进本轮进度；下次成功的 incremental BEFORE 仍使用最后一次成功提交的画面，因此跨过失败采样，而不累加一个不存在的中间分数。
 
-每个会话有后台线程，但同一 Monitor 的模型调用被共享锁串行化，一轮的多个模式一起持锁。HF 内部也锁住完整 sample，包括 grounding、hook 安装、生成和清理。status 不持有模型推理锁。多会话可共享常驻模型，但增加会话会增加排队时间；真实更新周期约为“采图 + 排队 + 定位 + 模型 + 其他开销 + interval”。
+每个会话有后台线程，但同一 Monitor 的不同会话推理轮次被共享锁串行化，一轮的多个模式和两个分支一起持锁。某一分支抛错时仍等待另一分支结束，再释放推理锁和清理未提交图片。HF 内部也锁住完整 sample，包括 grounding、hook 安装、生成和清理。status 不持有模型推理锁。多会话可共享常驻模型，但增加会话会增加排队时间；真实更新周期约为“采图 + 排队 + 定位及两分支推理 + 其他开销 + interval”。
 
 ### 6.2 8 图输入与模式
 
@@ -473,6 +530,16 @@ HF 严格解析完整 `<score>+25%</score>` 形式，得到 `s=0.25`，合法范
 - **failed**：当前融合进度 < 0.60，已有最近 `fail_stable_steps=8` 个有效结果，且窗口中没有一次相邻增量 ≥ `fail_min_progress=0.01`。停滞和持续回退都可能触发，窗口内也不要求每个值均低于阈值。
 - 其余情况为 **running**。终态不自动反转；重复帧、错误轮次和 status 请求均不增加窗口计数。
 
+启用双分支后，上述三条规则继续使用 **steering 分支的融合进度**。新增规则优先于 success 和原有 failed 规则：
+
+1. 两个分支各自使用本节原公式计算模式进度并融合为 `p_baseline`、`p_steering`（均裁剪到 `[0,1]`）。
+2. 默认 `difference_mode=absolute`，取 `d = abs(p_baseline - p_steering)`；两个有向选项分别取 `p_baseline - p_steering`、`p_steering - p_baseline`。
+3. 本轮 `d > progress_difference_threshold` 时，立即判 **failed**，不等待稳定窗口。等于阈值时不触发新规则（以 `1e-12` 绝对容差消除浮点舍入误差）；同轮即使满足旧 success 条件，差值失败仍优先。终态仍不可反转。
+
+例如 steering 为 0.75、baseline 为 0.40，默认绝对差为 0.35，超过 0.20 即 failed。steering 为 0.75、baseline 为 0.70 时差为 0.05，继续由原有窗口规则判断。这里比较的是两分支**各自累计、融合后的进度**；各模式本轮 `<score>` 的差另存为 `comparison.modes.*.score_difference`，不直接触发失败。融合比较会受到各模式平均及裁剪的影响，不等价于任一模式原始分数差超阈值。
+
+缺框时 steering 分支仍按 `on_missing_bbox` 配置降级或报错。降级后的实际输出照常参与进度和差值计算，并保留 `degraded / reason`；由于两个分支此前的 incremental 累计进度可能不同，本轮原始分数一致也不保证融合差为零。任一分支生成/解析错误或日志写入失败时，两分支均不推进 tracker、previous、轮次或判定窗口，也不把缺失分数当成零。
+
 这些是评分轨迹规则，`failed` 不等于相机/SAM3 服务故障；`success` 也不是经校准的成功概率。阈值沿用原配置，尚未针对 steering 和新部署任务重新校准。持续采图/推理错误不会自动触发 failed，服务没有内置的最大监控时长，需由上游设置超时。
 
 ### 6.5 代码定位与输出
@@ -506,6 +573,8 @@ results/monitor_sessions/<启动时间_随机后缀>/
 
 失败或重复的当前快照会清理，已提交图片和 reference 保留。终态/stop 不自动删除产物，也没有在线结果下载、会话恢复或目录保留期限接口；部署方按需要管理磁盘目录。
 
+双分支的 `manifest.json` 额外保存 `dual_branch` 配置与 `baseline_runtime` 模型信息；每条 `online_pred.jsonl` 与 HTTP 结果一致地包含 `branches / comparison`，便于复查触发失败的两分支分数。
+
 ## 7. 异常处理与排查
 
 | 现象 | 当前行为 | 接入方如何判断/处理 |
@@ -538,6 +607,14 @@ python -m monitor_runtime.service --backend deterministic --port 8879 \
 
 deterministic 在每次 status 时增加 `poll_count`，达到次数后返回 success；start 会覆盖同 ID，会话 stop 后仍可查询 failed。它与 GRM 的后台轮次、start 幂等和 stop 移除语义不同，只适合接口连通性演示。
 
-已有验证包含 26 个单元/契约测试，以及真实 GRM/SAM3 的双会话在线组合：2 个会话 × 2 轮 × forward/incremental，共 8 次模式评分，验证了干预实际生效、相同在线画面重跑得到相同分数、baseline 隔离及 stop 后不发布旧结果。详见[验证报告](attention_steering_validation.md)和[真实模型验证脚本](../tests/validate_real_steering.py)。
+现有单元/契约测试位于 [test_steering.py](../tests/test_steering.py)。双分支回归位于 [test_dual_branch.py](../tests/test_dual_branch.py)，覆盖并发同帧输入、独立进度累计、差值边界与方向、失败优先、原窗口规则、异常/日志失败回滚、停止及 HTTP/配置契约。运行：
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -q
+```
+
+2026-09-08 本次验证通过全部 51 项单元/契约测试，并在同一张 A100 80GB 上加载两个独立 GRM 8B，完成 2 轮 × 2 模式 × 2 分支（8 次评分）。steering 分支全部实际施加干预，baseline 无干预，baseline 单独重跑与并发时输出完全一致，两模型生成后均无残留 hooks。真实模型验证使用历史冻结图片及按 PNG 哈希匹配的 SAM3 检测框，未请求在线 SAM3 或连接物理机器人；本机报告保存于 `results/validation/dual_branch_smoke/report.json`。
+
+此前真实 GRM/SAM3 验证为单模型的双会话在线组合：2 个会话 × 2 轮 × forward/incremental，共 8 次模式评分，验证了干预实际生效、相同在线画面重跑得到相同分数、baseline 隔离及 stop 后不发布旧结果。详见[验证报告](attention_steering_validation.md)和[真实模型验证脚本](../tests/validate_real_steering.py)。该历史报告不代表本次双模型并发的验证结果。
 
 在线验证使用可控 HTTP JPEG 图像回放，Monitor API 通过 FastAPI TestClient 调用；没有连接物理机器人或测量实际部署网络延迟。报告中的最大 status 响应约 3.12 ms 是测试客户端读状态耗时，不是评分耗时或真实系统延迟承诺。GRM 峰值 torch allocated 17.15 GiB 也仅对应这次验证的 GRM 进程，不含 SAM3。当前结果支持实现机制与接口组合可用，不代表新任务成功率、长期遮挡跟踪或生产吞吐量已验证。

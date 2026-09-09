@@ -2,6 +2,8 @@
 
 在线接入优先阅读 [在线任务进度监控：实现、接口与用法](docs/online_attention_steering.md)，覆盖当前 GRM/HF/SAM3 流程、HTTP 字段、客户端示例与生命周期。
 
+双分支监控见该文档第 1.3 节和 [monitor_dual_branch.yaml](configs/monitor_dual_branch.yaml)：同时计算原始 GRM 与 steering GRM 的进度，保留 steering 的原有判定规则，增加融合进度差超过阈值立即失败的规则。
+
 Attention steering 的新增离线/在线流程、SAM3 启动方式和验证结果见 [README_steering.md](README_steering.md)。
 
 本文档面向当前仓库的 monitor / GRM 使用，重点说明离线进度评分、HTTP monitor 服务、配置方式、代码结构和可扩展点。文档只描述当前代码中已经存在并可直接定位的入口。

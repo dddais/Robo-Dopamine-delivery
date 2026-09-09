@@ -5,7 +5,8 @@ inference_engine: hf
 steering_config: ./steering.yaml
 model_path: /home/dais/workspace/Robo-Dopamine/pretrained_models/Robo-Dopamine-GRM-2.0-8B-Preview
 goal_image: ../examples/blank_goal.png
-robot_runtime_url: http://127.0.0.1:8767
+# robot_runtime_url: http://192.168.31.174:8767
+robot_runtime_url: http://127.0.0.1:18767
 observation_timeout: 3.0
 no_backward: true
 interval: 1.0

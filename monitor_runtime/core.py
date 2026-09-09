@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,6 +20,11 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def difference_exceeds_threshold(difference: float, threshold: float) -> bool:
+    # Do not turn decimal equality (e.g. 0.8 - 0.6 == 0.2) into a failure due to roundoff.
+    return difference > threshold and not math.isclose(difference, threshold, rel_tol=0., abs_tol=1e-12)
+
+
 @dataclass
 class MonitorState:
     """Tracks progress history and determines success / fail / running."""
@@ -32,6 +38,12 @@ class MonitorState:
     progress_history: list[float] = field(default_factory=list)
     success_counter: int = 0
     fail_counter: int = 0
+    progress_difference_threshold: float | None = None
+
+    def __post_init__(self) -> None:
+        threshold = self.progress_difference_threshold
+        if threshold is not None and (not math.isfinite(threshold) or not 0 <= threshold <= 1):
+            raise ValueError("progress_difference_threshold must be finite and in [0, 1]")
 
     def reset(self) -> None:
         self.status = MONITOR_STATUS_RUNNING
@@ -39,12 +51,22 @@ class MonitorState:
         self.success_counter = 0
         self.fail_counter = 0
 
-    def update(self, fused_progress: float) -> str:
+    def update(self, fused_progress: float, *, progress_difference: float | None = None) -> str:
         if self.status != MONITOR_STATUS_RUNNING:
             return self.status
 
+        if self.progress_difference_threshold is not None:
+            if progress_difference is None or not math.isfinite(progress_difference):
+                raise ValueError("Dual-branch monitoring requires a finite progress_difference")
+
         fused_progress = clamp(float(fused_progress), 0.0, 1.0)
         self.progress_history.append(fused_progress)
+
+        # A disagreement veto takes precedence even when this step would satisfy success.
+        if (self.progress_difference_threshold is not None
+                and difference_exceeds_threshold(progress_difference, self.progress_difference_threshold)):
+            self.status = MONITOR_STATUS_FAIL
+            return self.status
 
         if fused_progress >= self.success_threshold:
             recent = self.progress_history[-self.success_stable_steps:]

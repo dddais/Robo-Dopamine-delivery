@@ -1,0 +1,28 @@
+# 双分支：同一 checkpoint 的两个独立 HF 实例，共享冻结输入，分别生成。
+# CUDA_VISIBLE_DEVICES=0,1 python -m monitor_runtime.service --config configs/monitor_dual_branch.yaml
+host: 0.0.0.0
+port: 8877
+backend: grm
+inference_engine: hf
+steering_config: ./steering.yaml
+model_path: /home/dais/workspace/Robo-Dopamine/pretrained_models/Robo-Dopamine-GRM-2.0-8B-Preview
+goal_image: ../examples/blank_goal.png
+robot_runtime_url: http://127.0.0.1:18767
+observation_timeout: 3.0
+no_backward: true
+interval: 1.0
+device: cuda:0
+baseline_device: cuda:1
+max_new_tokens: 64
+output_root: ../results/monitor_sessions
+dual_branch: true
+# 两分支各自累计、融合后比较进度；0.20 表示 20 个百分点。严格大于才失败。
+progress_difference_threshold: 0.20
+# absolute / baseline_minus_steering / steering_minus_baseline
+difference_mode: absolute
+# 以下仍只依据 steering 分支进度判断，公式及窗口语义不变。
+success_threshold: 0.60
+success_stable_steps: 3
+success_max_drift: 0.05
+fail_stable_steps: 8
+fail_min_progress: 0.01

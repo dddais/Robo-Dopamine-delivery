@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from monitor_runtime.core import (
     MonitorSession,
     MonitorConflict,
     clamp,
+    difference_exceeds_threshold,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +42,7 @@ DEFAULT_GOAL_IMAGE = str(REPO_ROOT / "examples" / "blank_goal.png")
 CAMERA_KEYS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 FISHEYE_KEYS = ("cam_left_wrist", "cam_right_wrist")
 VALID_MODES = ("forward", "incremental", "backward")
+DIFFERENCE_MODES = ("absolute", "baseline_minus_steering", "steering_minus_baseline")
 
 
 def _safe_path(path: str) -> str:
@@ -213,6 +216,7 @@ class _SubtaskState:
     capture_index: int = 0
     step: int = 0
     tracker: ProgressTracker = field(default_factory=ProgressTracker)
+    baseline_tracker: ProgressTracker = field(default_factory=ProgressTracker)
     monitor: MonitorState = field(default_factory=MonitorState)
     latest: dict = field(default_factory=dict)
     error: str | None = None
@@ -229,7 +233,9 @@ class GRMMonitorBackend:
                  success_threshold=.60, success_stable_steps=5, success_max_drift=.02,
                  fail_stable_steps=8, fail_min_progress=.01, inference_engine='vllm',
                  steering_config=None, device='cuda:0', max_new_tokens=64,
-                 output_root=None, model=None, max_camera_skew_s=.25):
+                 output_root=None, model=None, max_camera_skew_s=.25,
+                 dual_branch=False, baseline_device=None, baseline_model=None,
+                 progress_difference_threshold=.20, difference_mode='absolute'):
         if not runtime_url.startswith(('http://','https://')):
             raise ValueError('robot_runtime_url must include http:// or https://')
         self.runtime_url = runtime_url.rstrip('/')
@@ -251,10 +257,29 @@ class GRMMonitorBackend:
         self.steering = load_steering(steering_config)
         if self.steering['enabled'] and inference_engine != 'hf':
             raise ValueError('Attention steering requires inference_engine=hf')
+        if not isinstance(dual_branch, bool):
+            raise ValueError('dual_branch must be boolean')
+        if dual_branch and (inference_engine != 'hf' or not self.steering['enabled']):
+            raise ValueError('dual_branch requires inference_engine=hf and enabled steering_config')
+        if difference_mode not in DIFFERENCE_MODES:
+            raise ValueError(f'difference_mode must be one of {DIFFERENCE_MODES}')
+        if (not isinstance(progress_difference_threshold, (int, float))
+                or isinstance(progress_difference_threshold, bool)
+                or not math.isfinite(progress_difference_threshold)
+                or not 0 <= progress_difference_threshold <= 1):
+            raise ValueError('progress_difference_threshold must be finite and in [0, 1]')
+        if baseline_model is not None and not dual_branch:
+            raise ValueError('baseline_model requires dual_branch')
+        self.dual_branch = dual_branch
+        self.device = device
+        self.baseline_device = baseline_device or device
+        self.difference_mode = difference_mode
+        self.progress_difference_threshold = float(progress_difference_threshold)
         if success_stable_steps < 1 or fail_stable_steps < 2:
             raise ValueError('Invalid monitor stability windows')
         self.monitor_options = dict(success_threshold=success_threshold, success_stable_steps=success_stable_steps,
-            success_max_drift=success_max_drift, fail_stable_steps=fail_stable_steps, fail_min_progress=fail_min_progress)
+            success_max_drift=success_max_drift, fail_stable_steps=fail_stable_steps, fail_min_progress=fail_min_progress,
+            progress_difference_threshold=self.progress_difference_threshold if dual_branch else None)
         self._ref_end_path = str(Path(goal_image).expanduser().resolve())
         if not Path(self._ref_end_path).is_file():
             raise FileNotFoundError(self._ref_end_path)
@@ -267,11 +292,72 @@ class GRMMonitorBackend:
         self._lock = threading.RLock()
         self._infer_lock = threading.Lock()
         self.sessions = {}
+        # Only committed GRM inputs are published. Keep URLs usable after stop
+        # so the operator can inspect the final score; files remain run artifacts.
+        self._preview_frames = {}
         if model is None:
             from examples.inference import GRMInference
             model = GRMInference(model_path, local_rank=local_rank, cuda_visible_devices=cuda_visible_devices,
                 engine=inference_engine, steering_config=steering_config, device=device, max_new_tokens=max_new_tokens)
         self.model = model
+        if dual_branch:
+            if baseline_model is None:
+                from examples.inference import GRMInference
+                baseline_model = GRMInference(model_path, engine='hf', steering_config=None,
+                    device=self.baseline_device, max_new_tokens=max_new_tokens)
+            steering_runtime = getattr(model, 'backend', None) or model
+            baseline_runtime = getattr(baseline_model, 'backend', None) or baseline_model
+            if (baseline_runtime is steering_runtime
+                    or getattr(baseline_runtime, 'model', baseline_runtime)
+                    is getattr(steering_runtime, 'model', steering_runtime)):
+                raise ValueError('Dual branches must use independent model instances')
+        self.baseline_model = baseline_model
+
+    def _dual_branch_options(self):
+        return {'enabled': self.dual_branch, 'metric': 'fused_progress',
+                'difference_mode': self.difference_mode,
+                'threshold': self.progress_difference_threshold,
+                'steering_device': self.device, 'baseline_device': self.baseline_device}
+
+    def _difference(self, baseline, steering):
+        delta = baseline - steering
+        if self.difference_mode == 'absolute':
+            return abs(delta)
+        return delta if self.difference_mode == 'baseline_minus_steering' else -delta
+
+    @staticmethod
+    def _infer_branch(model, samples, branch):
+        try:
+            return model.inference_batch(samples)
+        except Exception as exc:
+            raise RuntimeError(f'{branch} branch inference failed: {exc}') from exc
+
+    def _branch_results(self, samples, outputs, previous_tracker, branch):
+        if len(outputs) != len(samples) or {item.get('id') for item in outputs} != {s['id'] for s in samples}:
+            raise RuntimeError(f'{branch} GRM output IDs/count differ from input samples')
+        expected_modes = {sample['id']: sample['eval_mode'] for sample in samples}
+        if any(item.get('eval_mode') != expected_modes[item['id']] for item in outputs):
+            raise RuntimeError(f'{branch} GRM output modes do not match input IDs')
+        by_mode = {item.get('eval_mode'): item for item in outputs}
+        if set(by_mode) != set(self.active_modes):
+            raise RuntimeError(f'{branch} GRM output modes incomplete')
+        tracker = deepcopy(previous_tracker)
+        results = {}
+        for mode in self.active_modes:
+            item = by_mode[mode]
+            if self.inference_engine == 'hf':
+                if not item.get('valid', False):
+                    raise RuntimeError(f"Invalid {branch} {mode} score: {item.get('pred')}")
+                try:
+                    score = strict_parse_score(item['pred'])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(f"Invalid {branch} {mode} score: {item.get('pred')}") from exc
+            else:
+                score = parse_score(item.get('pred', ''))
+            results[mode] = {**tracker.update(mode, score), 'pred': item['pred'],
+                             'steering': item.get('steering', {})}
+        fused = clamp(sum(v['progress'] for v in results.values()) / len(results), 0., 1.)
+        return tracker, results, fused
 
     def _fetch_bytes(self, path):
         request = urllib.request.Request(self.runtime_url+_safe_path(path),method='GET')
@@ -351,26 +437,42 @@ class GRMMonitorBackend:
                 with self._lock:
                     if not self._is_active(state):
                         return None
-                outputs=self.model.inference_batch(samples)
-            if len(outputs)!=len(samples) or {item.get('id') for item in outputs}!={s['id'] for s in samples}:
-                raise RuntimeError('GRM output IDs/count differ from input samples')
-            by_mode={item.get('eval_mode'):item for item in outputs}
-            if set(by_mode)!=set(self.active_modes):
-                raise RuntimeError('GRM output modes incomplete')
-            scores={}
-            for mode,item in by_mode.items():
-                if self.inference_engine=='hf':
-                    if not item.get('valid',False):
-                        raise RuntimeError(f"Invalid {mode} score: {item.get('pred')}")
-                    scores[mode]=strict_parse_score(item['pred'])
+                if self.dual_branch:
+                    steering_samples = [{**deepcopy(s), 'condition': 'candidate_target'} for s in samples]
+                    baseline_samples = [{**deepcopy(s), 'condition': 'baseline'} for s in samples]
+                    # Wait for BOTH branches even on error, before releasing the lock or deleting frames.
+                    with ThreadPoolExecutor(max_workers=2, thread_name_prefix='grm-branch') as pool:
+                        steering_future = pool.submit(self._infer_branch, self.model, steering_samples, 'steering')
+                        baseline_future = pool.submit(self._infer_branch, self.baseline_model, baseline_samples, 'baseline')
+                        outputs = steering_future.result()
+                        baseline_outputs = baseline_future.result()
                 else:
-                    scores[mode]=parse_score(item.get('pred',''))
-            tracker=deepcopy(state.tracker)
+                    outputs=self.model.inference_batch(samples)
+            tracker,mode_results,fused=self._branch_results(samples,outputs,state.tracker,'steering')
             monitor=deepcopy(state.monitor)
-            mode_results={mode:{**tracker.update(mode,scores[mode]), 'pred':by_mode[mode]['pred'],
-                                'steering':by_mode[mode].get('steering',{})} for mode in self.active_modes}
-            fused=clamp(sum(v['progress'] for v in mode_results.values())/len(mode_results),0.,1.)
-            status=monitor.update(fused)
+            branch_fields = {}
+            timing_modes = list(mode_results.values())
+            if self.dual_branch:
+                baseline_tracker,baseline_results,baseline_fused=self._branch_results(
+                    samples,baseline_outputs,state.baseline_tracker,'baseline')
+                difference = self._difference(baseline_fused, fused)
+                status = monitor.update(fused, progress_difference=difference)
+                exceeded = difference_exceeds_threshold(difference, self.progress_difference_threshold)
+                branch_fields = {
+                    'branches': {'steering': {'progress': fused, 'modes': mode_results},
+                                 'baseline': {'progress': baseline_fused, 'modes': baseline_results}},
+                    'comparison': {'metric': 'fused_progress', 'difference_mode': self.difference_mode,
+                                   'difference': difference, 'threshold': self.progress_difference_threshold,
+                                   'threshold_exceeded': exceeded,
+                                   'modes': {mode: {
+                                       'score_difference': self._difference(baseline_results[mode]['score'], mode_results[mode]['score']),
+                                       'progress_difference': self._difference(baseline_results[mode]['progress'], mode_results[mode]['progress'])}
+                                       for mode in self.active_modes}}}
+                if exceeded:
+                    branch_fields['failure_reason'] = 'branch_difference_exceeded'
+                timing_modes.extend(baseline_results.values())
+            else:
+                status=monitor.update(fused)
             now=time.time()
             record={'step':state.step,'inference_step':state.step+1,'progress':fused,'fused':fused,
                 'progress_percent':fused*100,'status':status,'modes':mode_results,'frames':current,
@@ -378,16 +480,24 @@ class GRMMonitorBackend:
                 'inference_updated_at':now,'observation':observation,'engine':self.inference_engine,
                 'latency_s':time.monotonic()-started,
                 'timing':{'observation_ms':observation_ms,'queue_wait_ms':queue_ms,
-                          'grounding_ms':sum(v['steering'].get('grounding_ms',0) for v in mode_results.values()),
-                          'grm_ms':sum(v['steering'].get('grm_ms',0) for v in mode_results.values()),
-                          'total_ms':(time.monotonic()-started)*1000}}
+                          'grounding_ms':sum(v['steering'].get('grounding_ms',0) for v in timing_modes),
+                          'grm_ms':sum(v['steering'].get('grm_ms',0) for v in timing_modes),
+                          'total_ms':(time.monotonic()-started)*1000}, **branch_fields}
+            frame_set_id = uuid4().hex
+            record['preview'] = {'frame_set_id': frame_set_id, 'cameras': list(CAMERA_KEYS),
+                                 'kind': 'grm_after'}
             with self._lock:
                 if not self._is_active(state):
                     return None
                 # Persist before committing; a disk failure must not half-advance the trajectory.
                 with (self._session_dir(state)/'online_pred.jsonl').open('a') as stream:
                     stream.write(json.dumps(record)+'\n')
+                self._preview_frames[frame_set_id] = dict(current)
+                while len(self._preview_frames) > 128:
+                    self._preview_frames.pop(next(iter(self._preview_frames)))
                 state.tracker,state.monitor=tracker,monitor
+                if self.dual_branch:
+                    state.baseline_tracker=baseline_tracker
                 state.previous=current
                 state.last_observation=observation['identity']
                 state.step+=1
@@ -453,9 +563,14 @@ class GRMMonitorBackend:
                 state.inference_event.set()
             directory=self._session_dir(state);directory.mkdir(parents=True)
             runtime=getattr(getattr(self.model,'backend',self.model),'manifest',{})
+            branch_manifest = {}
+            if self.dual_branch:
+                baseline_runtime = getattr(self.baseline_model, 'backend', None) or self.baseline_model
+                branch_manifest = {'dual_branch': self._dual_branch_options(),
+                                   'baseline_runtime': getattr(baseline_runtime, 'manifest', {})}
             (directory/'manifest.json').write_text(json.dumps({'monitor_id':mid,'execution_id':execution,'subtask':task,
                 'target_queries':queries,'defer_inference':deferred,'generation':state.generation,'runtime':runtime,'active_modes':self.active_modes,
-                'monitor_options':self.monitor_options},indent=2))
+                'monitor_options':self.monitor_options, **branch_manifest},indent=2))
             self.sessions[mid]=state
             state.thread=threading.Thread(target=self._inference_loop,args=(state,),daemon=True,name=f'grm-{state.generation}')
             state.thread.start()
@@ -491,6 +606,15 @@ class GRMMonitorBackend:
             state.inference_event.set()
             return self.status(payload)
 
+    def frame_image(self, frame_set_id, camera):
+        # Resolve opaque registered IDs, never a caller-supplied filesystem path.
+        with self._lock:
+            frames = self._preview_frames.get(frame_set_id)
+            if frames is None or camera not in CAMERA_KEYS:
+                raise KeyError('unknown or expired inference frame')
+            path = frames[camera]
+        return Path(path).read_bytes()
+
     def stop(self,payload):
         with self._lock:
             state=self.sessions.pop(str(payload.get('monitor_id') or ''),None)
@@ -510,4 +634,5 @@ class GRMMonitorBackend:
             return {'status':'running','provider':'grm','model':self.model_path,'runtime_url':self.runtime_url,
                     'engine':self.inference_engine,'steering_enabled':self.steering['enabled'],
                     'profile_fingerprint':self.steering.get('profile_sha256'),'sessions':len(self.sessions),
+                    'dual_branch':self._dual_branch_options(),
                     'interval':self.interval,'active_modes':self.active_modes,'cameras':list(CAMERA_KEYS)}

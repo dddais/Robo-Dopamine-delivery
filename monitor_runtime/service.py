@@ -227,6 +227,19 @@ def create_app(backend: DeterministicMonitorBackend | None = None) -> "FastAPI":
     async def monitors_stop(body: dict[str, Any]):
         return _ok(await run_in_threadpool(backend.stop, body))
 
+    @app.get("/monitors/frames/{frame_set_id}/{camera}.png")
+    async def monitor_frame(frame_set_id: str, camera: str):
+        from fastapi.responses import Response
+
+        if not hasattr(backend, "frame_image"):
+            return _fail("backend does not provide inference images", status=404)
+        try:
+            data = await run_in_threadpool(backend.frame_image, frame_set_id, camera)
+        except (KeyError, FileNotFoundError) as exc:
+            return _fail(str(exc), status=404)
+        return Response(data, media_type="image/png",
+                        headers={"Cache-Control": "private, max-age=60"})
+
     return app
 
 
@@ -279,6 +292,17 @@ def _build_argparser(config: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=cfg("port", 8877))
     parser.add_argument("--inference-engine", choices=("vllm", "hf"), default=cfg("inference_engine", "vllm"))
     parser.add_argument("--steering-config", default=cfg("steering_config", None))
+    parser.add_argument("--dual-branch", action=argparse.BooleanOptionalAction,
+                        default=cfg("dual_branch", False),
+                        help="Run independent HF baseline and steering models on each observation.")
+    parser.add_argument("--baseline-device", default=cfg("baseline_device", None),
+                        help="Baseline model device; defaults to --device.")
+    parser.add_argument("--progress-difference-threshold", type=float,
+                        default=cfg("progress_difference_threshold", .20),
+                        help="Fail immediately when the fused progress difference is strictly above this value [0, 1].")
+    parser.add_argument("--difference-mode", choices=("absolute", "baseline_minus_steering", "steering_minus_baseline"),
+                        default=cfg("difference_mode", "absolute"),
+                        help="Direction of baseline/steering progress comparison.")
     parser.add_argument("--device", default=cfg("device", "cuda:0"))
     parser.add_argument("--max-new-tokens", type=int, default=cfg("max_new_tokens", 64))
     parser.add_argument("--output-root", default=cfg("output_root", None))
@@ -400,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to a YAML config file. CLI flags override values in the file.",
     )
     args = parser.parse_args(argv)
+    if args.dual_branch and args.backend != "grm":
+        parser.error("--dual-branch requires --backend grm")
 
     import uvicorn
 
@@ -438,6 +464,10 @@ def main(argv: list[str] | None = None) -> int:
             max_new_tokens=args.max_new_tokens,
             output_root=args.output_root,
             max_camera_skew_s=args.max_camera_skew_s,
+            dual_branch=args.dual_branch,
+            baseline_device=args.baseline_device,
+            progress_difference_threshold=args.progress_difference_threshold,
+            difference_mode=args.difference_mode,
         )
     else:
         observation_client = None
