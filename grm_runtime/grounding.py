@@ -36,7 +36,12 @@ def validate_bbox(box, size):
 
 
 def png_bytes(path):
-    with Image.open(path) as im:
+    data = Path(path).read_bytes()
+    with Image.open(io.BytesIO(data)) as im:
+        # Online snapshots are already RGB PNGs. Send their exact bytes instead
+        # of decoding and recompressing a full camera frame on every request.
+        if im.format == "PNG" and im.mode == "RGB" and not getattr(im, "is_animated", False):
+            return data, im.size
         image = im.convert("RGB")
         out = io.BytesIO()
         image.save(out, format="PNG")

@@ -324,6 +324,7 @@ class DualBranchTests(unittest.TestCase):
 
     def test_config_errors_fail_before_loading_models(self):
         cases = [dict(inference_engine='vllm'), dict(steering_config=None), dict(dual_branch='true'),
+                 dict(hf_batch_size=0), dict(hf_batch_size=True), dict(hf_batch_size=1.5),
                  dict(progress_difference_threshold=float('nan')), dict(progress_difference_threshold=float('inf')),
                  dict(progress_difference_threshold=-.1), dict(progress_difference_threshold=1.1),
                  dict(progress_difference_threshold=True), dict(difference_mode='unknown')]
@@ -342,6 +343,8 @@ class DualBranchTests(unittest.TestCase):
         steered, baseline = loader.call_args_list
         self.assertEqual(steered.args, baseline.args)
         self.assertEqual(steered.kwargs['max_new_tokens'], baseline.kwargs['max_new_tokens'])
+        self.assertEqual(steered.kwargs['hf_batch_size'], 2)
+        self.assertEqual(baseline.kwargs['hf_batch_size'], 2)
         self.assertEqual(baseline.kwargs['device'], 'cuda:2')
         self.assertEqual(baseline.kwargs['engine'], 'hf')
         self.assertIsNone(baseline.kwargs['steering_config'])

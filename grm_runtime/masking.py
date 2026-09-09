@@ -284,3 +284,37 @@ def make_attention_mask_hook(
         return args, new_kwargs
 
     return hook
+
+
+def make_batched_attention_mask_hook(specs, num_query_heads, swap_bias, *, query_scope="all"):
+    """Apply independent per-row hooks; None specs leave baseline rows untouched.
+
+    Each non-None spec is (heads, selected_keys, negative_keys, diagnostics).
+    Keys already include each row's left padding. The original causal/padding
+    mask is retained for every row, both at prefill and cached decode.
+    """
+    import torch
+
+    hooks = [None if spec is None else make_attention_mask_hook(
+        *spec[:3], num_query_heads, swap_bias, spec[3], query_scope=query_scope)
+        for spec in specs]
+
+    def hook(module, args, kwargs):
+        mask = kwargs.get("attention_mask")
+        if mask is None or mask.ndim != 4 or not mask.is_floating_point():
+            raise RuntimeError("Batched steering requires a 4D floating-point attention mask")
+        if mask.shape[0] not in (1, len(hooks)):
+            raise RuntimeError("Attention mask batch size differs from steering samples")
+        rows, changed = [], False
+        for index, row_hook in enumerate(hooks):
+            row = mask[index:index+1] if mask.shape[0] != 1 else mask
+            result = row_hook(module, args, {**kwargs, "attention_mask": row}) if row_hook else None
+            if result is not None:
+                row = result[1]["attention_mask"]
+                changed = True
+            rows.append(row.expand(1, num_query_heads, *row.shape[2:]))
+        if not changed:
+            return None
+        return args, {**kwargs, "attention_mask": torch.cat(rows, dim=0)}
+
+    return hook

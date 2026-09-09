@@ -16,7 +16,7 @@ from grm_runtime.common import file_sha, parse_score, progress_step, target_quer
 from grm_runtime.config import load_heads, load_steering
 from grm_runtime.grounding import AlignmentError, GroundingClient, GroundingError, validate_bbox
 from grm_runtime.hf_backend import HFBackend, infer_spans
-from grm_runtime.masking import ImageSpan, bbox_to_token_positions, make_attention_mask_hook, resolve_negative_positions
+from grm_runtime.masking import ImageSpan, bbox_to_token_positions, make_attention_mask_hook, make_batched_attention_mask_hook, resolve_negative_positions
 from monitor_runtime.core import MonitorState, MonitorConflict
 from monitor_runtime.grm_backend import GRMMonitorBackend, _SubtaskState
 from monitor_runtime.service import create_app, DeterministicMonitorBackend
@@ -77,6 +77,29 @@ class GeometryTests(unittest.TestCase):
 
 
 class MaskTests(unittest.TestCase):
+    def test_batched_scopes_preserve_each_rows_heads_keys_and_padding(self):
+        for scope in ('all', 'prefill', 'last_prompt', 'decode'):
+            for query_length in (4, 1):
+                with self.subTest(scope=scope, query_length=query_length):
+                    mask = torch.zeros(3, 1, query_length, 8)
+                    mask[0, :, :, :2] = -float('inf')
+                    mask[:, :, :, 7] = -float('inf')
+                    specs = [([0], [3], [4], {}), None, ([1], [5], [6], {})]
+                    hook = make_batched_attention_mask_hook(specs, 2, 6, query_scope=scope)
+                    actual = hook(None, (), {'attention_mask': mask})
+                    expected = []
+                    for i, spec in enumerate(specs):
+                        row = mask[i:i+1]
+                        one = make_attention_mask_hook(*spec[:3], 2, 6, {}, query_scope=scope) if spec else None
+                        result = one(None, (), {'attention_mask': row}) if one else None
+                        expected.append((result[1]['attention_mask'] if result else row).expand(1, 2, query_length, 8))
+                    self.assertTrue(torch.equal(actual[1]['attention_mask'] if actual else mask.expand(3, 2, query_length, 8),
+                                                torch.cat(expected)))
+                    if actual:
+                        self.assertTrue(torch.isneginf(actual[1]['attention_mask'][..., 7]).all())
+                    with self.assertRaises(RuntimeError):
+                        hook(None, (), {'attention_mask': mask[:2]})
+
     def test_selected_heads_causal_and_decode(self):
         diag={};hook=make_attention_mask_hook([1],[1],[2],3,6,diag)
         mask=torch.zeros(1,1,4,5);mask[...,4]=-float('inf')
@@ -131,6 +154,8 @@ class ProtocolTests(unittest.TestCase):
         parser=_build_argparser({'no_backward':True})
         self.assertTrue(parser.parse_args([]).no_backward)
         self.assertFalse(parser.parse_args(['--backward']).no_backward)
+        self.assertEqual(parser.parse_args([]).hf_batch_size, 2)
+        self.assertEqual(parser.parse_args(['--hf-batch-size', '1']).hf_batch_size, 1)
     def test_three_source_borda_matches_frozen_grm_order(self):
         from grm_runtime.ranking import consensus
         source=ROOT/'assets/steering'
@@ -179,7 +204,8 @@ class GroundingHTTPTests(unittest.TestCase):
         class Detector:
             fingerprint='test-model'
             def detect(self,image,queries):return [{'bbox':[2,3,10,12],'score':.9,'query':queries[0]}]
-        self.server=make_server('127.0.0.1',0,Detector())
+        self.detector=Detector()
+        self.server=make_server('127.0.0.1',0,self.detector)
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
         self.client=GroundingClient(f'http://127.0.0.1:{self.server.server_port}',cache_dir=Path(self.tmp.name)/'cache')
     def tearDown(self):
@@ -187,7 +213,14 @@ class GroundingHTTPTests(unittest.TestCase):
     def test_png_contract_and_cache(self):
         row=self.client.detect(self.path,['red object'])
         self.assertEqual(row['selected']['bbox'],[2,3,10,12])
+        self.assertEqual(row['image_sha256'],file_sha(self.path))
         self.assertEqual(row,self.client.detect(self.path,['red object']))
+    def test_model_restart_invalidates_cached_detection(self):
+        first=self.client.detect(self.path,['object'])
+        self.detector.fingerprint='new-model'
+        second=self.client.detect(self.path,['object'])
+        self.assertEqual(second['model_fingerprint'],'new-model')
+        self.assertNotEqual(first['request_id'],second['request_id'])
     def test_hash_mismatch_rejected(self):
         old=self.client._request
         def bad(route,payload=None):

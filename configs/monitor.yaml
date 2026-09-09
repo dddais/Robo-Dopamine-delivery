@@ -17,7 +17,7 @@ backend: grm
 
 # ---------------- Robot Runtime (图像源) ----------------
 # 机器人运行时 HTTP 地址, 用来拉取最新的三视角 JPEG 帧
-robot_runtime_url: <ip>:8767
+robot_runtime_url: http://127.0.0.1:18767
 # 固定拉取三路相机: cam_high, cam_left_wrist, cam_right_wrist
 # 拉单张图的超时 (秒)
 observation_timeout: 3.0
@@ -31,10 +31,10 @@ auto_success_after_polls: 0
 # ====================================================================
 
 # GRM 权重路径 (HF repo id 或本地目录)
-model_path: /path/to/Robo-Dopamine-GRM-2.0-4B-Preview
+model_path: /home/dais/workspace/Robo-Dopamine/pretrained_models/Robo-Dopamine-GRM-2.0-8B-Preview
 
 # 目标/参考图。没有目标图时用 examples/blank_goal.png (空白占位)
-goal_image: /path/to/Robo-dopamine/examples/blank_goal.png
+goal_image: /home/dais/workspace/Robo-Dopamine-delivery/examples/blank_goal.png
 
 # 鱼眼去畸变配置 (fisheye_process/config.yaml)。不需要去畸变就留 null
 # fisheye_config: /path/to/fisheye_process/config.yaml
@@ -44,7 +44,7 @@ fisheye_config: null
 no_backward: true
 
 # 后台推理节拍 (秒)。GRM 在独立线程按此间隔持续推理, poll 只读最新结果
-interval: 1.0
+interval: 0.1
 
 # 可选 GPU 绑定。留 null 时不修改当前进程环境变量
 local_rank: null

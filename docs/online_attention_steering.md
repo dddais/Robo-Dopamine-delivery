@@ -59,10 +59,11 @@ SAM3 返回 `status: ready`；Monitor 的 `data` 应有 `provider: grm`、`engin
 | monitor / `steering_config` | `./steering.yaml` | 加载干预配置 |
 | monitor / `goal_image` | `../examples/blank_goal.png` | 全部会话共用的参考终点；有真实完成图时可替换 |
 | monitor / `no_backward` | `true` | 默认仅运行 forward、incremental |
-| monitor / `interval` | `1.0` 秒 | 每轮工作结束后的等待时间，代码最低取 0.1 秒；不是每秒一次推理的保证 |
+| monitor / `interval` | `0.1` 秒 | 单、双分支 YAML 均减少轮间空等；每轮工作结束后等待，代码最低取 0.1 秒，不是总推理周期 |
 | monitor / `observation_timeout` | `3.0` 秒 | 单次 Robot Runtime HTTP 请求超时 |
 | monitor / `max_camera_skew_s` | `0.25` 秒（代码默认，YAML 未写） | 三路响应都有时间戳时允许的最大时间差 |
 | monitor / `max_new_tokens` | `64` | GRM 生成长度上限 |
+| monitor / `hf_batch_size` | `2` | 每个 HF 分支一次 generate 的样本上限；设为 1 可串行对比 |
 | monitor / `output_root` | `../results/monitor_sessions` | 会话图片和日志根目录 |
 | monitor / `fisheye_config` | 未设置 | 可选腕部相机去畸变配置 |
 | steering / `enabled` | `true` | 启用目标区域 attention bias |
@@ -73,7 +74,7 @@ SAM3 返回 `status: ready`；Monitor 的 `data` 应有 `provider: grm`、`engin
 | steering / `negative_scope` | `target_span` | 同一目标图像 span 内、bbox 外的视觉 keys 为负区域 |
 | steering / `on_missing_bbox` | `baseline` | 检测缺失/歧义/服务请求失败时，该 sample 使用无 bias 的 HF 推理 |
 | steering / `grounding.url`、`timeout_s` | `http://127.0.0.1:8878`、`30.0` 秒 | SAM3 地址与单次请求超时 |
-| SAM3 / `threshold`、`mask_threshold` | `0.3`、`0.5` | 候选置信度阈值与 mask 阈值 |
+| SAM3 / `threshold`、`mask_threshold` | `0.3`、`0.5` | 候选置信度阈值；mask_threshold 仅保留配置兼容，bbox 后处理不使用 |
 
 成功/失败窗口参数及其精确定义见第 6.4 节。Monitor CLI 参数覆盖 YAML，例如临时开启 backward：
 
@@ -89,6 +90,15 @@ Monitor YAML 中的 `steering_config / goal_image / fisheye_config / output_root
 ### 1.3 双分支监控
 
 双分支同时运行原始 GRM 和 attention steering GRM：从同一 checkpoint 各加载一个独立 HF 模型实例，每轮并发处理相同的冻结图像、任务、reference 和 previous。原始分支使用无干预的 HF greedy 推理；steering 分支按原配置定位目标并施加 attention bias。两分支的 incremental 进度分别累计。
+
+默认 `hf_batch_size: 2`，每个分支把 forward/incremental 合成一次 batch=2 的
+generate，整轮为两个独立模型各生成一次。每行有自己的图像、补齐位置、bbox
+和 attention mask；两分支全部完成并验证有效后才发布完整结果。开启 backward
+时默认再用一个 batch=1 处理尾项。`--hf-batch-size 1` 同时让两个分支恢复串行。
+
+合批按 processor 输出的有效 token 长度分组，异长样本自动拆批，避免当前 BF16
+Qwen3-VL 在 padded batch 下出现较大得分变化。正常在线两模式输入等长，仍为
+batch=2；实际行数以结果中的 `steering.batch_size` 为准。
 
 已有单分支配置默认行为不变。在原启动命令上增加参数即可启用：
 
@@ -354,17 +364,28 @@ status 只读取最近已提交结果，不触发 GRM 推理，也不增加 `pol
 | `modes.<mode>.steering.applied / degraded / reason` | 是否实际施加干预、是否降级、降级原因（有时才存在） |
 | `modes.<mode>.steering.grounding.<label>` | 对应图像的 SAM3 结果和客户端选择结果；网络请求失败时可能没有该条目 |
 | `modes.<mode>.steering.grounding.<label>.selected.bbox` | 选中目标的像素 `xyxy` 框；歧义/无检测时 `selected` 为 null |
+| `modes.<mode>.steering.grounding.<label>.reused_in_batch` | 是否复用了本轮相同冻结图片、相同目标词的定位结果；复用 bbox 后仍独立映射本模式的 token 位置 |
+| `modes.<mode>.steering.image_cache_hits / prepare_ms` | 本 sample 复用已解码图片的次数 / 图片、prompt、processor 和输入准备耗时（毫秒） |
+| `modes.<mode>.steering.batch_id / batch_size / batch_index / padding_left` | 实际 generate 批次、行数、行号和左侧 padding 数；spans/目标位置已包含偏移 |
+| `modes.<mode>.steering.batch_prepare_ms / batch_grm_ms / batch_total_ms` | 整批准备、生成、总耗时；同批每行重复携带，需按 batch_id 去重后求和 |
 | `modes.<mode>.steering.per_layer` | 各层 hook 的调用和生效次数，例如 `prefill_calls / decode_calls / applied_calls` |
 | `modes.<mode>.steering.spans / target_positions / negative_positions / heads` | 图像 token spans、目标/负区域绝对 token 位置、选中 heads；部分字段仅定位成功时存在 |
 | `observation.cameras.<camera>` | 相机 `frame_id / timestamp / image_sha256` |
 | `observation.identity / synchronization_verified` | 用于去重的组合标识 / 三路时间戳检查是否可验证 |
 | `observation.preprocess_fingerprint / fisheye_enabled` | 预处理配置指纹与去畸变开关 |
 | `frames / session_dir` | 三路冻结 PNG 的服务器绝对路径 / 会话产物目录；不是图片下载 URL |
-| `timing` | `observation_ms / queue_wait_ms / grounding_ms / grm_ms / total_ms` |
+| `timing` | `observation_ms / queue_wait_ms / prepare_ms / grounding_ms / grm_ms / total_ms` |
 | `latency_s` | 本轮耗时，秒；不含随后 interval 等待和客户端轮询延迟 |
 | `final_status / progress_history` | 终态时附加的状态与全部已提交融合进度 |
 
-`steering` 和 `grounding` 位于各个 `modes` 内，**没有顶层 `result.steering` 或 `result.grounding`**。`timing.grounding_ms / grm_ms` 汇总各模式耗时；双分支下汇总两个分支。`total_ms` 是本轮墙钟耗时，还包括采图、排队、预处理等；双分支并发时耗时之和可以大于 `total_ms`。
+`steering` 和 `grounding` 位于各个 `modes` 内，**没有顶层 `result.steering` 或 `result.grounding`**。`timing.prepare_ms / grounding_ms / grm_ms` 汇总各模式实际耗时；双分支下汇总两个分支。`total_ms` 是本轮墙钟耗时，还包括采图、排队等；双分支并发时耗时之和可以大于 `total_ms`。缓存中的 `grounding.<label>.latency_ms` 保留首次 SAM3 检测的耗时，不能把两个模式里的该字段相加当作本轮检测耗时。服务每条 `[GRM]` 日志也会输出本轮 `latency=…s`，不含轮间等待。
+
+批量生成后，每个模式的 `prepare_ms / grm_ms` 是整批耗时按行数均分的记账值，
+不代表该模式单独推理的延迟；顶层求和不会重复计时。`grounding_ms` 仍是该模式
+实际定位准备耗时，`steering.total_ms` 为上述三项之和。
+
+异长样本拆批时，`regroup_prepare_ms` 记录额外分组准备开销，已经计入模式的
+`prepare_ms / total_ms`；`batch_*` 字段仅记录分组后对应 generate 的工作。
 
 ### 3.3 `POST /monitors/stop`
 
@@ -418,7 +439,7 @@ X-Timestamp: 1788830000.125
 
 去重按各相机的 `X-Frame-Id`，缺失时回退到保存 PNG 的 SHA-256，然后组合成 observation identity。metadata 中全局 `frame_id` 用于记录，不能代替各相机 header。真实新帧应更新相机帧号；无帧号且图片字节不变时，会按重复画面跳过评分和稳定窗口计数。
 
-可选鱼眼去畸变只处理腕部相机。之后保存冻结 PNG，GRM 和 SAM3 都读取该画面。`observation.cameras.*.image_sha256` 是磁盘 PNG 文件字节哈希；grounding 的 `image_sha256` 是重新编码 RGB PNG 请求载荷的哈希，二者不一定相等，不能直接用这两个哈希比较像素是否一致。
+可选鱼眼去畸变只处理腕部相机。之后保存冻结 PNG，GRM 和 SAM3 都读取该画面。`observation.cameras.*.image_sha256` 是磁盘 PNG 文件字节哈希；grounding 的 `image_sha256` 是实际发送的 RGB PNG 请求载荷的哈希。当前在线 RGB PNG 直接发送原始文件字节，两者相等；非 RGB PNG、JPEG 等输入仍先转 RGB PNG，旧版日志也使用重新编码的载荷，这些情况下两种哈希可能不同。
 
 ## 5. SAM3 检测接口
 
@@ -470,7 +491,18 @@ print(result["selection_status"], result["selected"])
 
 服务会对查询词产生的重叠候选按 IoU ≥ 0.8 去重。GRM 客户端再按置信度排序：第二候选得分 ≥ 第一候选得分减 0.05 时判为 `ambiguous`，不选择实例；否则选最高分。`selected / selection_status` 是客户端新增字段，原始 SAM3 HTTP 响应没有它们。
 
-缓存键包含图片内容、目标词和 SAM3 模型指纹；即使命中缓存，也会请求 health 检查指纹。forward/incremental 对同一冻结 AFTER 图可复用检测。实现没有沿用上一帧框、长期目标 tracker 或跨相机实例关联；配置多个干预视角时，每张图独立定位。
+`GroundingClient` 的跨调用缓存键包含图片内容、目标词和 SAM3 模型指纹；每次进入该客户端都会请求 health 检查指纹。在一次 HF `inference_batch` 内，forward/incremental 对相同冻结图片、相同目标词直接共享检测结果，后续模式不重复编码、请求 health 或检测。该批次缓存随调用结束丢弃，下一轮仍检查模型指纹；文件被改写或目标词变化时不复用。歧义/无检测结果可共享，请求异常不缓存，后续模式可重试。
+
+同批次还复用已解码的 RGB 图片，最多保留 16 张；定位缓存最多 128 项。processor
+一次接收最多 `hf_batch_size` 条八图样本，按每行左侧补齐后独立构造 token spans
+和 masks，并在一次 generate 内并行评分。共享的是像素和 bbox，不是另一模式的
+token 位置或得分。双分支各有自己的缓存和模型。配置多个干预视角时每张图独立
+定位，不沿用上一帧框。性能测量方法见 [monitor_performance.md](monitor_performance.md)。
+
+SAM3 当前使用 `post_process_object_detection`，只筛选/缩放 bbox 和分数，省去
+mask 的 sigmoid、插值和二值化后处理。模型前向仍按原 SAM3 执行，未修改精度或
+跳过内部 mask decoder；框和分数计算与原分割后处理一致。模型指纹包含后处理
+版本，更新并重启 SAM3 后，旧检测缓存因指纹变化而失效。
 
 ## 6. 实现原理与代码入口
 
@@ -506,7 +538,7 @@ Processor 对实际 8 图输入计算视觉 token spans；SAM3 bbox 按实际 im
 
 当前冻结 top-8（层、query head，均从 0 开始）：`(19,16), (19,23), (19,10), (20,4), (19,0), (18,30), (20,13), (22,15)`。这些来自当前 GRM 8B 的排名；profile 校验模型路径、config 哈希及层/head 数等信息。
 
-实现通过目标层 self-attention 的 forward pre-hook 修改 attention mask，在 softmax 前施加 bias；模型使用 HF eager attention、greedy generation、`use_cache=True`、`output_attentions=False`。默认 `query_scope: all` 覆盖 prefill 与后续 decode；新增文本 key 的 bias 为零，原有 causal 禁止位保留。每个 sample 独立生成，不跨 sample 复用 KV cache，hooks 通过 `finally` 清理。
+实现通过目标层 self-attention 的 forward pre-hook 修改 attention mask，在 softmax 前施加 bias；模型使用 HF eager attention、greedy generation、`use_cache=True`、`output_attentions=False`。默认 `query_scope: all` 覆盖 prefill 与后续 decode；新增文本 key 的 bias 为零，原有 causal/padding 禁止位保留。batch 每行使用自己的 heads、目标/负区域和 KV cache，baseline 或降级行保留原 mask。按输入行号解码并去掉完整补齐后的 prompt，EOS/pad 由 tokenizer 去除。hooks 通过 `finally` 清理。
 
 其他可配置项：`query_scope` 支持 `prefill / last_prompt / decode`；`negative_scope` 支持 `all_visual / other_spans / none`；`intervention_labels` 可指定 BEFORE/AFTER 的真实相机标签，不能指定两张 reference 图。多图配置下任一目标缺失，默认对整个 sample 降级 baseline。
 

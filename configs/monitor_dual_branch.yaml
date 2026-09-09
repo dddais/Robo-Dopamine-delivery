@@ -10,10 +10,13 @@ goal_image: ../examples/blank_goal.png
 robot_runtime_url: http://127.0.0.1:18767
 observation_timeout: 3.0
 no_backward: true
-interval: 1.0
+# Wait after BOTH branches complete; this is not the total inference period.
+interval: 0.1
 device: cuda:0
 baseline_device: cuda:1
 max_new_tokens: 64
+# Each independent branch generates forward + incremental in one batch.
+hf_batch_size: 2
 output_root: ../results/monitor_sessions
 dual_branch: true
 # 两分支各自累计、融合后比较进度；0.20 表示 20 个百分点。严格大于才失败。

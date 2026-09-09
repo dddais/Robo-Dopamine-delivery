@@ -235,7 +235,7 @@ class GRMMonitorBackend:
                  steering_config=None, device='cuda:0', max_new_tokens=64,
                  output_root=None, model=None, max_camera_skew_s=.25,
                  dual_branch=False, baseline_device=None, baseline_model=None,
-                 progress_difference_threshold=.20, difference_mode='absolute'):
+                 progress_difference_threshold=.20, difference_mode='absolute', hf_batch_size=2):
         if not runtime_url.startswith(('http://','https://')):
             raise ValueError('robot_runtime_url must include http:// or https://')
         self.runtime_url = runtime_url.rstrip('/')
@@ -254,6 +254,9 @@ class GRMMonitorBackend:
         self.interval = max(.1,float(interval))
         self.max_camera_skew_s = max_camera_skew_s
         self.inference_engine = inference_engine
+        if isinstance(hf_batch_size, bool) or not isinstance(hf_batch_size, int) or hf_batch_size < 1:
+            raise ValueError('hf_batch_size must be a positive integer')
+        self.hf_batch_size = hf_batch_size
         self.steering = load_steering(steering_config)
         if self.steering['enabled'] and inference_engine != 'hf':
             raise ValueError('Attention steering requires inference_engine=hf')
@@ -298,13 +301,14 @@ class GRMMonitorBackend:
         if model is None:
             from examples.inference import GRMInference
             model = GRMInference(model_path, local_rank=local_rank, cuda_visible_devices=cuda_visible_devices,
-                engine=inference_engine, steering_config=steering_config, device=device, max_new_tokens=max_new_tokens)
+                engine=inference_engine, steering_config=steering_config, device=device, max_new_tokens=max_new_tokens,
+                hf_batch_size=hf_batch_size)
         self.model = model
         if dual_branch:
             if baseline_model is None:
                 from examples.inference import GRMInference
                 baseline_model = GRMInference(model_path, engine='hf', steering_config=None,
-                    device=self.baseline_device, max_new_tokens=max_new_tokens)
+                    device=self.baseline_device, max_new_tokens=max_new_tokens, hf_batch_size=hf_batch_size)
             steering_runtime = getattr(model, 'backend', None) or model
             baseline_runtime = getattr(baseline_model, 'backend', None) or baseline_model
             if (baseline_runtime is steering_runtime
@@ -480,6 +484,7 @@ class GRMMonitorBackend:
                 'inference_updated_at':now,'observation':observation,'engine':self.inference_engine,
                 'latency_s':time.monotonic()-started,
                 'timing':{'observation_ms':observation_ms,'queue_wait_ms':queue_ms,
+                          'prepare_ms':sum(v['steering'].get('prepare_ms',0) for v in timing_modes),
                           'grounding_ms':sum(v['steering'].get('grounding_ms',0) for v in timing_modes),
                           'grm_ms':sum(v['steering'].get('grm_ms',0) for v in timing_modes),
                           'total_ms':(time.monotonic()-started)*1000}, **branch_fields}
@@ -503,7 +508,8 @@ class GRMMonitorBackend:
                 state.step+=1
                 state.latest=record
                 state.error=None
-            print(f"[GRM] {state.monitor_id} step={record['step']} progress={fused:.3f} [{status}]",flush=True)
+            print(f"[GRM] {state.monitor_id} step={record['step']} progress={fused:.3f} [{status}] "
+                  f"latency={record['latency_s']:.3f}s",flush=True)
             return record
         finally:
             # Preserve committed frames and reference for reproducible session replay only.
@@ -635,4 +641,5 @@ class GRMMonitorBackend:
                     'engine':self.inference_engine,'steering_enabled':self.steering['enabled'],
                     'profile_fingerprint':self.steering.get('profile_sha256'),'sessions':len(self.sessions),
                     'dual_branch':self._dual_branch_options(),
-                    'interval':self.interval,'active_modes':self.active_modes,'cameras':list(CAMERA_KEYS)}
+                    'interval':self.interval,'hf_batch_size':self.hf_batch_size,
+                    'active_modes':self.active_modes,'cameras':list(CAMERA_KEYS)}

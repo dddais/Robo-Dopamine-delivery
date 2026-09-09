@@ -397,6 +397,7 @@ class GRMInference:
         steering_config: str | None = None,
         device: str = "cuda:0",
         max_new_tokens: int = 64,
+        hf_batch_size: int = 2,
     ):
         configure_runtime_env(local_rank, cuda_visible_devices)
         self.engine = engine
@@ -404,7 +405,8 @@ class GRMInference:
         if engine == "hf":
             from grm_runtime.hf_backend import HFBackend
             self.backend = HFBackend(model_path, steering_config=steering_config, device=device,
-                min_pixels=min_pixels, max_pixels=max_pixels, max_new_tokens=max_new_tokens)
+                min_pixels=min_pixels, max_pixels=max_pixels, max_new_tokens=max_new_tokens,
+                batch_size=hf_batch_size)
             self.model = self.backend.model
             self.processor = self.backend.processor
             return

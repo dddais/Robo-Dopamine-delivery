@@ -4,3 +4,4 @@ model_path: /home/dais/workspace/model/sam3
 device: cuda:0
 threshold: 0.3
 mask_threshold: 0.5
+# mask_threshold is retained for old configs; bbox-only postprocessing does not use it.

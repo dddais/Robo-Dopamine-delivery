@@ -305,6 +305,8 @@ def _build_argparser(config: dict[str, Any]) -> argparse.ArgumentParser:
                         help="Direction of baseline/steering progress comparison.")
     parser.add_argument("--device", default=cfg("device", "cuda:0"))
     parser.add_argument("--max-new-tokens", type=int, default=cfg("max_new_tokens", 64))
+    parser.add_argument("--hf-batch-size", type=int, default=cfg("hf_batch_size", 2),
+                        help="Samples per HF generate call, independently in each branch; 1 enables serial comparison.")
     parser.add_argument("--output-root", default=cfg("output_root", None))
     parser.add_argument("--max-camera-skew-s", type=float, default=cfg("max_camera_skew_s", 0.25))
     parser.add_argument(
@@ -445,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
 
         backend = GRMMonitorBackend(
             model_path=args.model_path,
+            hf_batch_size=args.hf_batch_size,
             goal_image=args.goal_image,
             runtime_url=args.robot_runtime_url,
             observation_timeout=args.observation_timeout,

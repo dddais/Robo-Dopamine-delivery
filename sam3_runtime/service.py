@@ -26,6 +26,7 @@ class SAM3Detector:
         if not 0 <= self.threshold <= 1 or not 0 <= self.mask_threshold <= 1:
             raise ValueError("SAM3 thresholds must be in [0,1]")
         metadata = {"model_path": str(Path(model_path).resolve()), "config": self.model.config.to_dict(),
+                    "postprocess": "object_detection_v1",
                     "threshold": threshold, "mask_threshold": mask_threshold,
                     "weights": [(p.name, p.stat().st_size, p.stat().st_mtime_ns)
                                 for p in sorted(Path(model_path).glob('*.safetensors'))]}
@@ -37,19 +38,13 @@ class SAM3Detector:
             inputs = self.processor(images=image, text=query, return_tensors="pt").to(self.device)
             with self.torch.inference_mode():
                 outputs = self.model(**inputs)
-            result = self.processor.post_process_instance_segmentation(outputs,
-                threshold=self.threshold, mask_threshold=self.mask_threshold,
+            result = self.processor.post_process_object_detection(outputs,
+                threshold=self.threshold,
                 target_sizes=inputs["original_sizes"].tolist())[0]
-            for index, score in enumerate(result["scores"]):
-                if result.get("boxes") is not None:
-                    box = result["boxes"][index].detach().cpu().tolist()
-                else:
-                    import numpy as np
-                    mask = result["masks"][index].detach().cpu().numpy().squeeze()
-                    ys, xs = np.nonzero(mask)
-                    if not len(xs):
-                        continue
-                    box = [float(xs.min()), float(ys.min()), float(xs.max()+1), float(ys.max()+1)]
+            # Transfer once instead of synchronizing the GPU for each box/score.
+            boxes = result["boxes"].detach().cpu().tolist()
+            scores = result["scores"].detach().cpu().tolist()
+            for box, score in zip(boxes, scores):
                 from grm_runtime.grounding import validate_bbox
                 try:
                     box = validate_bbox(box, image.size)
@@ -65,7 +60,7 @@ class SAM3Detector:
                         duplicate = True
                         break
                 if not duplicate:
-                    rows.append({"bbox": box, "score": float(score.detach().cpu()), "query": query})
+                    rows.append({"bbox": box, "score": float(score), "query": query})
         return sorted(rows, key=lambda row: -row["score"])
 
 

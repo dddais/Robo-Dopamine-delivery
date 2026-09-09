@@ -9,9 +9,11 @@ goal_image: ../examples/blank_goal.png
 robot_runtime_url: http://127.0.0.1:18767
 observation_timeout: 3.0
 no_backward: true
-interval: 1.0
+# Wait after each completed inference round; inference itself takes additional time.
+interval: 0.1
 device: cuda:0
 max_new_tokens: 64
+hf_batch_size: 2
 output_root: ../results/monitor_sessions
 success_threshold: 0.60
 success_stable_steps: 3
