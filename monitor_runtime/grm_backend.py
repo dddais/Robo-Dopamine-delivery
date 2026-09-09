@@ -224,6 +224,7 @@ class _SubtaskState:
     defer_inference: bool = False
     inference_event: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
+    tracking_stream: Any = None
 
 
 class GRMMonitorBackend:
@@ -235,7 +236,8 @@ class GRMMonitorBackend:
                  steering_config=None, device='cuda:0', max_new_tokens=64,
                  output_root=None, model=None, max_camera_skew_s=.25,
                  dual_branch=False, baseline_device=None, baseline_model=None,
-                 progress_difference_threshold=.20, difference_mode='absolute', hf_batch_size=2):
+                 progress_difference_threshold=.20, difference_mode='absolute', hf_batch_size=2,
+                 tracking_config=None):
         if not runtime_url.startswith(('http://','https://')):
             raise ValueError('robot_runtime_url must include http:// or https://')
         self.runtime_url = runtime_url.rstrip('/')
@@ -258,6 +260,20 @@ class GRMMonitorBackend:
             raise ValueError('hf_batch_size must be a positive integer')
         self.hf_batch_size = hf_batch_size
         self.steering = load_steering(steering_config)
+        from grm_runtime.common import load_yaml
+        self.tracking_config = load_yaml(tracking_config, {'enabled', 'poll_interval_s', 'max_frame_age_s'})[0] if tracking_config else {}
+        self.tracking_config.setdefault('enabled', False)
+        if not isinstance(self.tracking_config['enabled'], bool):
+            raise ValueError('tracking.enabled must be boolean')
+        for key, default in (('poll_interval_s', .1), ('max_frame_age_s', 2.)):
+            value = self.tracking_config.setdefault(key, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f'tracking.{key} must be finite and positive')
+        if self.tracking_config['enabled'] and (inference_engine != 'hf' or not self.steering['enabled']):
+            raise ValueError('Tracking requires HF and enabled attention steering')
+        self.tracking_cameras = [c for c in CAMERA_KEYS if 'after_' + c in self.steering.get('intervention_labels', [])]
+        if self.tracking_config['enabled'] and not self.tracking_cameras:
+            raise ValueError('Tracking requires at least one AFTER camera intervention label')
         if self.steering['enabled'] and inference_engine != 'hf':
             raise ValueError('Attention steering requires inference_engine=hf')
         if not isinstance(dual_branch, bool):
@@ -381,6 +397,7 @@ class GRMMonitorBackend:
         return self._cache_root/state.generation
 
     def _snapshot_current(self, state, *, reference=False):
+        requested_at = time.time()
         metadata=self._fetch_json('/observations/latest/metadata')
         endpoints=metadata.get('binary_endpoints')
         if not isinstance(endpoints,dict):
@@ -413,6 +430,7 @@ class GRMMonitorBackend:
             identity=fingerprint({c:(v['frame_id'] or v['image_sha256']) for c,v in cameras.items()})
             return images, {'cameras':cameras,'frame_id':metadata.get('frame_id'),
                             'timestamp':metadata.get('timestamp'), 'identity':identity,
+                            'snapshot_requested_at':requested_at, 'snapshot_received_at':time.time(),
                             'synchronization_verified':len(timestamps)==3,
                             'preprocess_fingerprint':self.preprocess_fingerprint,
                             'fisheye_enabled':self.fisheye_remap is not None}
@@ -425,7 +443,14 @@ class GRMMonitorBackend:
 
     def _run_one_step(self,state):
         started=time.monotonic()
-        current,observation=self._snapshot_current(state)
+        online_grounding = None
+        if state.tracking_stream is not None:
+            snapshot = state.tracking_stream.read()
+            if snapshot is None:
+                return None
+            current, observation, online_grounding = snapshot
+        else:
+            current,observation=self._snapshot_current(state)
         observation_ms=(time.monotonic()-started)*1000
         if observation['identity']==state.last_observation:
             shutil.rmtree(Path(next(iter(current.values()))).parent,ignore_errors=True)
@@ -435,6 +460,8 @@ class GRMMonitorBackend:
             for sample in samples:
                 if state.queries:
                     sample['target_queries']=state.queries
+                if online_grounding is not None:
+                    sample['online_grounding'] = deepcopy(online_grounding)
             queue_start=time.monotonic()
             with self._infer_lock:
                 queue_ms=(time.monotonic()-queue_start)*1000
@@ -478,6 +505,8 @@ class GRMMonitorBackend:
             else:
                 status=monitor.update(fused)
             now=time.time()
+            if 'snapshot_requested_at' in observation:
+                observation['input_age_at_publish_s'] = now-observation['snapshot_requested_at']
             record={'step':state.step,'inference_step':state.step+1,'progress':fused,'fused':fused,
                 'progress_percent':fused*100,'status':status,'modes':mode_results,'frames':current,
                 'subtask':state.subtask,'subtask_idx':state.subtask_index or 0,
@@ -521,13 +550,26 @@ class GRMMonitorBackend:
             while not state.stop_event.is_set() and state.ref_start is None:
                 try:
                     reference,observation=self._snapshot_current(state,reference=True)
+                    stream = None
+                    if self.tracking_config['enabled']:
+                        from monitor_runtime.tracking import LatestTrackedFrames
+                        from grm_runtime.grounding import GroundingClient
+                        stream = LatestTrackedFrames(capture=lambda: self._snapshot_current(state),
+                            client=GroundingClient(**self.steering.get('grounding', {})),
+                            cameras=self.tracking_cameras, queries=state.queries,
+                            directory=self._session_dir(state), session_id=state.generation,
+                            poll_interval_s=self.tracking_config['poll_interval_s'],
+                            max_frame_age_s=self.tracking_config['max_frame_age_s'])
                     with self._lock:
                         if not self._is_active(state):
                             return
                         state.ref_start=reference
                         state.previous=reference
                         state.last_observation=observation['identity']
+                        state.tracking_stream=stream
                         state.error=None
+                    if stream:
+                        stream.start()
                 except Exception as exc:
                     with self._lock:
                         state.error=str(exc)
@@ -545,7 +587,8 @@ class GRMMonitorBackend:
                 state.stop_event.wait(self.interval)
         finally:
             # Completed observations/logs intentionally remain as run artifacts; no model hooks remain installed.
-            pass
+            if state.tracking_stream is not None:
+                state.tracking_stream.close()
 
     def start(self,payload):
         mid=str(payload.get('monitor_id') or '')
@@ -576,7 +619,7 @@ class GRMMonitorBackend:
                                    'baseline_runtime': getattr(baseline_runtime, 'manifest', {})}
             (directory/'manifest.json').write_text(json.dumps({'monitor_id':mid,'execution_id':execution,'subtask':task,
                 'target_queries':queries,'defer_inference':deferred,'generation':state.generation,'runtime':runtime,'active_modes':self.active_modes,
-                'monitor_options':self.monitor_options, **branch_manifest},indent=2))
+                'monitor_options':self.monitor_options,'tracking':self.tracking_config, **branch_manifest},indent=2))
             self.sessions[mid]=state
             state.thread=threading.Thread(target=self._inference_loop,args=(state,),daemon=True,name=f'grm-{state.generation}')
             state.thread.start()
@@ -591,9 +634,15 @@ class GRMMonitorBackend:
                 raise ValueError('monitor_id does not belong to execution_id')
             latest=deepcopy(state.latest)
             updated=latest.get('inference_updated_at',state.created_at)
-            result={'provider':'grm','warming_up':state.ref_start is None,
+            tracking = state.tracking_stream.status() if state.tracking_stream is not None else None
+            result={'provider':'grm','warming_up':state.ref_start is None or bool(
+                        tracking and not tracking['ready'] and not state.monitor.is_finished),
                     'inference_enabled':state.inference_event.is_set(),**latest,
                     'result_age_s':time.time()-updated,'session_dir':str(self._session_dir(state))}
+            if tracking:
+                result['tracking'] = tracking
+                if tracking['error']:
+                    result['error'] = tracking['error']
             if state.error:
                 result['error']=state.error
             if state.monitor.is_finished:
@@ -609,6 +658,8 @@ class GRMMonitorBackend:
             state = self.sessions[session.monitor_id]
             if state.ref_start is None:
                 raise ValueError('reference is not ready')
+            if state.tracking_stream is not None and not state.tracking_stream.status()['ready']:
+                raise ValueError('tracking reference is not ready')
             state.inference_event.set()
             return self.status(payload)
 
@@ -626,6 +677,8 @@ class GRMMonitorBackend:
             state=self.sessions.pop(str(payload.get('monitor_id') or ''),None)
             if state:
                 state.stop_event.set()
+        if state and state.tracking_stream is not None:
+            state.tracking_stream.close()
         if state and state.thread and state.thread.is_alive():
             state.thread.join(timeout=5.)
         return {'stopped':True,'monitor_id':payload.get('monitor_id'),
@@ -642,4 +695,5 @@ class GRMMonitorBackend:
                     'profile_fingerprint':self.steering.get('profile_sha256'),'sessions':len(self.sessions),
                     'dual_branch':self._dual_branch_options(),
                     'interval':self.interval,'hf_batch_size':self.hf_batch_size,
+                    'tracking':self.tracking_config,
                     'active_modes':self.active_modes,'cameras':list(CAMERA_KEYS)}

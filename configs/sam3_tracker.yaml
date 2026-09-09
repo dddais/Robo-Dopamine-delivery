@@ -1,0 +1,21 @@
+# Detector + prompted instance tracker. GPU numbering follows CUDA_VISIBLE_DEVICES.
+host: 127.0.0.1
+port: 8878
+model_path: /home/dais/workspace/model/sam3
+device: cuda:0
+dtype: bfloat16
+bbox_only: true
+num_threads: 4
+profile: false
+threshold: 0.3
+tracking:
+  enabled: true
+  device: cuda:0
+  dtype: bfloat16
+  redetect_interval_s: 5.0
+  max_gap_s: 2.0
+  min_score: 0.5
+  match_iou: 0.1
+  memory_frames: 32
+  session_ttl_s: 60.0
+  max_sessions: 8

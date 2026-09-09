@@ -1,0 +1,6 @@
+# Pass --tracking-config configs/tracking.yaml to either HF Monitor configuration.
+enabled: true
+# Minimum capture-cycle period; no FIFO, no catch-up processing of old frames.
+poll_interval_s: 0.1
+# Reject a completed tracked snapshot older than this at GRM read time.
+max_frame_age_s: 2.0

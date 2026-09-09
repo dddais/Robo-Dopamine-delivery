@@ -190,6 +190,28 @@ class PreparationTests(unittest.TestCase):
                     self.assertEqual(new.tobytes(), old.convert('RGB').tobytes())
                     self.assertEqual(size, old.size)
 
+    def test_online_tracker_result_is_checked_and_never_redetected_in_grm(self):
+        from grm_runtime.common import file_sha
+        samples = self.samples()
+        row = dict(bbox=[0., 0., 8., 8.], score=.9, query='carrot')
+        result = dict(image_sha256=file_sha(samples[0]['image'][5]), image_size=[16, 16],
+            coordinate_space='input_image_xyxy', status='ok', selected=row, candidates=[row],
+            selection_status='ok', source='sam3_tracker')
+        for sample in samples:
+            sample['online_grounding'] = {'after_cam_high': result}
+        output = self.backend.inference_batch(samples)
+        self.backend.grounder.detect.assert_not_called()
+        self.assertTrue(all(r['steering']['applied'] for r in output))
+        self.assertTrue(all(r['steering']['grounding']['after_cam_high']['source'] == 'sam3_tracker' for r in output))
+        result.update(status='no_detection', selected=None, candidates=[], selection_status='tracking_error')
+        output = self.backend.inference_batch(samples)
+        self.assertTrue(all(r['steering']['degraded'] for r in output))
+        self.backend.grounder.detect.assert_not_called()
+        result['image_sha256'] = 'different-frame'
+        with self.assertRaises(ValueError):
+            self.backend.inference_batch(samples)
+        self.assertFalse(self.backend.model.attention._forward_pre_hooks)
+
 
 class BatchedGenerationTests(unittest.TestCase):
     detection = PreparationTests.detection

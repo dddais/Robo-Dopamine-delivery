@@ -7,7 +7,7 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -112,6 +112,27 @@ class DualBranchTests(unittest.TestCase):
 
     def run_step(self):
         return self.backend._run_one_step(self.state)
+
+    def test_tracking_handoff_is_shared_by_both_modes_branches_and_preview(self):
+        from grm_runtime.common import file_sha
+        grounding = {'after_cam_high': {'image_sha256': file_sha(self.current['cam_high']),
+            'image_size': [32,32], 'selected': {'bbox': [2,3,10,12]}, 'source': 'sam3_tracker'}}
+        stream = SimpleNamespace(read=Mock(return_value=(self.current, {'identity': 'tracked'}, grounding)),
+                                 close=Mock(), status=lambda: {'ready': True})
+        self.state.tracking_stream = stream
+        self.backend._snapshot_current = Mock(side_effect=AssertionError('GRM must consume tracked slot'))
+        record = self.run_step()
+        for model in (self.steering, self.baseline):
+            for sample in model.calls[0]:
+                self.assertEqual(sample['online_grounding'], grounding)
+                self.assertEqual(sample['image'][5:], list(self.current.values()))
+        self.assertEqual(record['observation']['identity'], 'tracked')
+        self.assertEqual(self.backend.frame_image(record['preview']['frame_set_id'], 'cam_high'),
+                         Path(self.current['cam_high']).read_bytes())
+        self.assertEqual(self.state.previous, self.current)
+        self.backend._snapshot_current.assert_not_called()
+        self.backend.stop({'monitor_id': 'm'})
+        stream.close.assert_called_once()
 
     def test_same_inputs_concurrent_branches_separate_conditions_and_trackers(self):
         barrier = threading.Barrier(2)

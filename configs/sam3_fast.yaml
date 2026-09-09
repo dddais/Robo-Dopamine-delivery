@@ -1,0 +1,10 @@
+# Optional mixed precision detection. Small bbox/score changes versus FP32 are expected.
+host: 127.0.0.1
+port: 8878
+model_path: /home/dais/workspace/model/sam3
+device: cuda:0
+dtype: bfloat16
+bbox_only: true
+num_threads: 4
+profile: false
+threshold: 0.3

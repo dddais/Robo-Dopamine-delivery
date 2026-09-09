@@ -2,6 +2,11 @@ host: 127.0.0.1
 port: 8878
 model_path: /home/dais/workspace/model/sam3
 device: cuda:0
+dtype: float32
+# Skip the unused mask forward, preserving the FP32 box/score computation.
+bbox_only: true
+num_threads: 4
+profile: false
 threshold: 0.3
 mask_threshold: 0.5
 # mask_threshold is retained for old configs; bbox-only postprocessing does not use it.

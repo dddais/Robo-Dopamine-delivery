@@ -15,56 +15,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-class SAM3Detector:
-    def __init__(self, model_path, device="cuda:0", threshold=0.3, mask_threshold=0.5):
-        import torch
-        from transformers import Sam3Model, Sam3Processor
-        self.torch, self.device = torch, device
-        self.processor = Sam3Processor.from_pretrained(model_path)
-        self.model = Sam3Model.from_pretrained(model_path).to(device).eval()
-        self.threshold, self.mask_threshold = float(threshold), float(mask_threshold)
-        if not 0 <= self.threshold <= 1 or not 0 <= self.mask_threshold <= 1:
-            raise ValueError("SAM3 thresholds must be in [0,1]")
-        metadata = {"model_path": str(Path(model_path).resolve()), "config": self.model.config.to_dict(),
-                    "postprocess": "object_detection_v1",
-                    "threshold": threshold, "mask_threshold": mask_threshold,
-                    "weights": [(p.name, p.stat().st_size, p.stat().st_mtime_ns)
-                                for p in sorted(Path(model_path).glob('*.safetensors'))]}
-        self.fingerprint = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
-
-    def detect(self, image, queries):
-        rows = []
-        for query in queries:
-            inputs = self.processor(images=image, text=query, return_tensors="pt").to(self.device)
-            with self.torch.inference_mode():
-                outputs = self.model(**inputs)
-            result = self.processor.post_process_object_detection(outputs,
-                threshold=self.threshold,
-                target_sizes=inputs["original_sizes"].tolist())[0]
-            # Transfer once instead of synchronizing the GPU for each box/score.
-            boxes = result["boxes"].detach().cpu().tolist()
-            scores = result["scores"].detach().cpu().tolist()
-            for box, score in zip(boxes, scores):
-                from grm_runtime.grounding import validate_bbox
-                try:
-                    box = validate_bbox(box, image.size)
-                except ValueError:
-                    continue
-                # Collapse duplicate instances returned by synonymous queries.
-                duplicate = False
-                for previous in rows:
-                    b = previous["bbox"]
-                    area = max(0, min(b[2],box[2])-max(b[0],box[0])) * max(0,min(b[3],box[3])-max(b[1],box[1]))
-                    union = (b[2]-b[0])*(b[3]-b[1])+(box[2]-box[0])*(box[3]-box[1])-area
-                    if union and area/union >= 0.8:
-                        duplicate = True
-                        break
-                if not duplicate:
-                    rows.append({"bbox": box, "score": float(score), "query": query})
-        return sorted(rows, key=lambda row: -row["score"])
+from .detector import SAM3Detector
 
 
-def make_server(host, port, detector):
+def make_server(host, port, detector, tracker=None):
     semaphore = threading.BoundedSemaphore(1)
 
     class Handler(BaseHTTPRequestHandler):
@@ -82,10 +36,12 @@ def make_server(host, port, detector):
         def do_GET(self):
             if self.path != "/health":
                 return self.send_json({"error": "not found"}, 404)
-            self.send_json({"status": "ready", "model_fingerprint": detector.fingerprint})
+            self.send_json({"status": "ready", "model_fingerprint": detector.fingerprint,
+                "tracking_enabled": tracker is not None,
+                "tracker_fingerprint": tracker.fingerprint if tracker else None})
 
         def do_POST(self):
-            if self.path != "/grounding/detect":
+            if self.path not in {"/grounding/detect", "/tracking/update", "/tracking/close"}:
                 return self.send_json({"error": "not found"}, 404)
             if not semaphore.acquire(blocking=False):
                 return self.send_json({"error": "SAM3 busy; retry later"}, 503)
@@ -95,6 +51,15 @@ def make_server(host, port, detector):
                 if not 0 < size <= 20 * 1024 * 1024:
                     raise ValueError("Request must be between 1 byte and 20 MiB")
                 request = json.loads(self.rfile.read(size))
+                if self.path.startswith('/tracking/'):
+                    if tracker is None:
+                        return self.send_json({"error": "Tracking is disabled in SAM3 config"}, 400)
+                    session_id = request.get('session_id')
+                    if not isinstance(session_id, str) or not 1 <= len(session_id) <= 200:
+                        raise ValueError('Invalid tracking session_id')
+                    if self.path == '/tracking/close':
+                        tracker.close(session_id)
+                        return self.send_json({'closed': True, 'session_id': session_id})
                 data = base64.b64decode(request["image_png_base64"], validate=True)
                 sha = hashlib.sha256(data).hexdigest()
                 if sha != request["image_sha256"]:
@@ -106,11 +71,17 @@ def make_server(host, port, detector):
                 with Image.open(io.BytesIO(data)) as im:
                     image = im.convert("RGB")
                 started = time.monotonic()
+                if self.path == '/tracking/update':
+                    result = tracker.update(session_id, image, queries, sha)
+                    return self.send_json({**result, "request_id": request["request_id"],
+                        "session_id": session_id, "image_sha256": sha, "image_size": list(image.size),
+                        "coordinate_space": "input_image_xyxy", "model_fingerprint": tracker.fingerprint})
                 rows = detector.detect(image, queries)
                 self.send_json({"request_id": request["request_id"], "image_sha256": sha,
                     "image_size": list(image.size), "coordinate_space": "input_image_xyxy",
                     "model_fingerprint": detector.fingerprint, "status": "ok" if rows else "no_detection",
-                    "candidates": rows, "latency_ms": (time.monotonic()-started)*1000})
+                    "candidates": rows, "latency_ms": (time.monotonic()-started)*1000,
+                    "timing": getattr(detector, 'last_timing', {})})
             except (ValueError, KeyError) as exc:
                 self.send_json({"error": str(exc)}, 400)
             except Exception as exc:
@@ -118,7 +89,15 @@ def make_server(host, port, detector):
             finally:
                 semaphore.release()
 
-    return ThreadingHTTPServer((host, port), Handler)
+    class Server(ThreadingHTTPServer):
+        def service_actions(self):
+            if tracker is not None and semaphore.acquire(blocking=False):
+                try:
+                    tracker.expire()
+                finally:
+                    semaphore.release()
+
+    return Server((host, port), Handler)
 
 
 def main():
@@ -126,11 +105,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
-    cfg, base = load_yaml(args.config, {"model_path","device","threshold","mask_threshold","host","port"})
+    cfg, base = load_yaml(args.config, {"model_path","device","threshold","mask_threshold","host","port",
+                                      "dtype", "bbox_only", "profile", "num_threads", "tracking"})
     host, port = cfg.pop("host", "127.0.0.1"), cfg.pop("port", 8878)
     from grm_runtime.common import resolve_path
     cfg["model_path"] = resolve_path(cfg["model_path"], base)
-    server = make_server(host, port, SAM3Detector(**cfg))
+    tracking = cfg.pop('tracking', {})
+    if not isinstance(tracking, dict) or not isinstance(tracking.get('enabled', False), bool):
+        raise ValueError('tracking must be a mapping with boolean enabled')
+    enabled = tracking.pop('enabled', False)
+    detector = SAM3Detector(**cfg)
+    engine = None
+    if enabled:
+        from .tracker import SAM3VideoTracker, TrackingEngine
+        video = SAM3VideoTracker(cfg['model_path'], device=tracking.pop('device', cfg.get('device', 'cuda:0')),
+            dtype=tracking.pop('dtype', 'bfloat16'), memory_frames=tracking.pop('memory_frames', 32))
+        engine = TrackingEngine(detector, video, **tracking)
+    elif tracking:
+        raise ValueError('Remove tracking options or set tracking.enabled: true')
+    server = make_server(host, port, detector, engine)
     print(f"SAM3 ready at http://{host}:{port}", flush=True)
     try:
         server.serve_forever()

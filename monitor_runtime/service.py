@@ -292,6 +292,8 @@ def _build_argparser(config: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=cfg("port", 8877))
     parser.add_argument("--inference-engine", choices=("vllm", "hf"), default=cfg("inference_engine", "vllm"))
     parser.add_argument("--steering-config", default=cfg("steering_config", None))
+    parser.add_argument("--tracking-config", default=cfg("tracking_config", None),
+                        help="Optional independent SAM3 tracking/capture worker config.")
     parser.add_argument("--dual-branch", action=argparse.BooleanOptionalAction,
                         default=cfg("dual_branch", False),
                         help="Run independent HF baseline and steering models on each observation.")
@@ -412,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
     if known.config:
         base = Path(known.config).expanduser().resolve().parent
         from grm_runtime.common import resolve_path
-        for key in ("steering_config", "goal_image", "fisheye_config", "output_root"):
+        for key in ("steering_config", "tracking_config", "goal_image", "fisheye_config", "output_root"):
             if config.get(key):
                 config[key] = resolve_path(config[key], base)
 
@@ -463,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
             fail_min_progress=args.fail_min_progress,
             inference_engine=args.inference_engine,
             steering_config=args.steering_config,
+            tracking_config=args.tracking_config,
             device=args.device,
             max_new_tokens=args.max_new_tokens,
             output_root=args.output_root,

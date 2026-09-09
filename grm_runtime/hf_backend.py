@@ -15,7 +15,7 @@ from PIL import Image
 
 from .common import CONDITIONS, file_sha, fingerprint, parse_score, target_queries
 from .config import load_heads, load_steering
-from .grounding import GroundingClient, GroundingError, validate_bbox
+from .grounding import GroundingClient, GroundingError, validate_bbox, validate_grounding_result
 from .masking import ImageSpan, bbox_to_token_positions, make_attention_mask_hook, make_batched_attention_mask_hook, matched_wrong_position_set, resolve_negative_positions
 from .prompt import IMAGE_LABELS, SYSTEM_PROMPT, messages
 
@@ -192,7 +192,10 @@ class HFBackend:
             with Image.open(span.path) as im:
                 size = im.size
             # Explicit annotations are for reproducible/offline diagnostics; they must name the exact file hash.
-            if label in sample.get("grounding", {}):
+            if label in sample.get("online_grounding", {}):
+                result = deepcopy(sample['online_grounding'][label])
+                validate_grounding_result(result, file_sha(span.path), size, queries)
+            elif label in sample.get("grounding", {}):
                 row = sample["grounding"][label]
                 if row.get("file_sha256") != file_sha(span.path):
                     raise ValueError("Supplied bbox image fingerprint mismatch")

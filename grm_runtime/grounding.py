@@ -8,6 +8,7 @@ import json
 import math
 import threading
 import urllib.request
+from uuid import uuid4
 from pathlib import Path
 
 from PIL import Image
@@ -109,3 +110,38 @@ class GroundingClient:
         ambiguous = len(rows) > 1 and rows[1]["score"] >= rows[0]["score"] - 0.05
         return {**cached, "selected": None if ambiguous else selected,
                 "selection_status": "ambiguous" if ambiguous else "ok" if selected else "no_detection"}
+
+    def track(self, path, queries, session_id):
+        # Tracking is history-dependent. Never use the detector's content cache.
+        data, size = png_bytes(path)
+        sha, request_id = hashlib.sha256(data).hexdigest(), uuid4().hex
+        result = self._request('/tracking/update', {'session_id': session_id, 'request_id': request_id,
+            'image_sha256': sha, 'queries': queries, 'image_png_base64': base64.b64encode(data).decode()})
+        if result.get('session_id') != session_id or result.get('request_id') != request_id:
+            raise AlignmentError('Tracker response belongs to a different session/request')
+        validate_grounding_result(result, sha, size, queries)
+        return result
+
+    def close_track(self, session_id):
+        return self._request('/tracking/close', {'session_id': session_id})
+
+
+def validate_grounding_result(result, sha, size, queries):
+    """Validate an asynchronous result against the exact frozen GRM input."""
+    if (result.get('image_sha256') != sha or result.get('image_size') != list(size)
+            or result.get('coordinate_space') != 'input_image_xyxy'):
+        raise AlignmentError('Grounding result does not match the frozen input image')
+    if result.get('status') not in {'ok', 'no_detection'}:
+        raise GroundingError('Grounding result failed')
+    for row in result.get('candidates', []):
+        validate_bbox(row.get('bbox'), size)
+        score = row.get('score')
+        if (not isinstance(score, (int, float)) or not math.isfinite(score)
+                or not 0 <= score <= 1 or row.get('query') not in queries):
+            raise AlignmentError('Invalid tracked candidate score/query')
+    selected = result.get('selected')
+    if selected is not None:
+        if result.get('selection_status') != 'ok' or selected not in result.get('candidates', []):
+            raise AlignmentError('Invalid tracked selection')
+    elif result.get('selection_status') not in {'no_detection', 'ambiguous', 'tracking_error'}:
+        raise AlignmentError('Missing tracked selection status')
