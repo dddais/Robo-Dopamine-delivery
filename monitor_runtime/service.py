@@ -227,6 +227,17 @@ def create_app(backend: DeterministicMonitorBackend | None = None) -> "FastAPI":
     async def monitors_stop(body: dict[str, Any]):
         return _ok(await run_in_threadpool(backend.stop, body))
 
+    @app.get("/monitors/{monitor_id}/records")
+    async def monitor_records(monitor_id: str, execution_id: str, cursor: int = 0, limit: int = 100):
+        if not hasattr(backend, "records"):
+            return _fail("backend does not provide progress journals", status=404)
+        try:
+            return _ok(await run_in_threadpool(backend.records, monitor_id, execution_id, cursor, limit))
+        except KeyError as exc:
+            return _fail(str(exc), status=404)
+        except ValueError as exc:
+            return _fail(str(exc), status=409)
+
     @app.get("/monitors/frames/{frame_set_id}/{camera}.png")
     async def monitor_frame(frame_set_id: str, camera: str):
         from fastapi.responses import Response

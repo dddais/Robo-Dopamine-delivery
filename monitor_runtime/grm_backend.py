@@ -311,6 +311,9 @@ class GRMMonitorBackend:
         self._lock = threading.RLock()
         self._infer_lock = threading.Lock()
         self.sessions = {}
+        # Keep registered journals readable after /monitors/stop. Recording
+        # clients drain by byte cursor without polling/advancing inference.
+        self._record_journals = {}
         # Only committed GRM inputs are published. Keep URLs usable after stop
         # so the operator can inspect the final score; files remain run artifacts.
         self._preview_frames = {}
@@ -523,6 +526,11 @@ class GRMMonitorBackend:
             with self._lock:
                 if not self._is_active(state):
                     return None
+                # Timestamp publication under the same lock as journal reads so
+                # read_at is a watermark for all previously published records.
+                record['inference_updated_at'] = time.time()
+                if 'snapshot_requested_at' in observation:
+                    observation['input_age_at_publish_s'] = record['inference_updated_at'] - observation['snapshot_requested_at']
                 # Persist before committing; a disk failure must not half-advance the trajectory.
                 with (self._session_dir(state)/'online_pred.jsonl').open('a') as stream:
                     stream.write(json.dumps(record)+'\n')
@@ -621,6 +629,7 @@ class GRMMonitorBackend:
                 'target_queries':queries,'defer_inference':deferred,'generation':state.generation,'runtime':runtime,'active_modes':self.active_modes,
                 'monitor_options':self.monitor_options,'tracking':self.tracking_config, **branch_manifest},indent=2))
             self.sessions[mid]=state
+            self._record_journals[mid] = (execution, state.generation, directory, task)
             state.thread=threading.Thread(target=self._inference_loop,args=(state,),daemon=True,name=f'grm-{state.generation}')
             state.thread.start()
             return self.status({'monitor_id':mid})
@@ -651,6 +660,43 @@ class GRMMonitorBackend:
                 status=state.monitor.status,progress=latest.get('progress',0.),created_at=state.created_at,
                 updated_at=updated,error=state.error,poll_count=state.step,result=result,
                 message='grm monitor backend')
+
+    def records(self, monitor_id, execution_id, cursor=0, limit=100):
+        if type(cursor) is not int or cursor < 0 or type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError('invalid journal cursor or limit')
+        with self._lock:
+            entry = self._record_journals.get(monitor_id)
+            if entry is None:
+                raise KeyError('unknown monitor journal')
+            execution, generation, directory, task = entry
+            if execution_id != execution:
+                raise ValueError('monitor journal does not belong to execution_id')
+            complete = monitor_id not in self.sessions or self.sessions[monitor_id].monitor.is_finished
+            path = directory / 'online_pred.jsonl'
+            rows, next_cursor, more = [], cursor, False
+            if path.exists():
+                with path.open('rb') as stream:
+                    stream.seek(0, 2)
+                    if cursor > stream.tell():
+                        raise ValueError('journal cursor exceeds file size')
+                    if cursor:
+                        stream.seek(cursor - 1)
+                        if stream.read(1) != b'\n':
+                            raise ValueError('journal cursor must be at a record boundary')
+                    stream.seek(cursor)
+                    for _ in range(limit):
+                        line = stream.readline()
+                        if not line or not line.endswith(b'\n'):
+                            break  # A writer may still be appending this record.
+                        rows.append(json.loads(line))
+                        next_cursor = stream.tell()
+                    more = bool(stream.readline().endswith(b'\n'))
+            elif cursor:
+                raise ValueError('journal is empty')
+            return {'monitor_id': monitor_id, 'execution_id': execution, 'generation': generation,
+                    'subtask': task, 'session_dir': str(directory), 'records': rows,
+                    'next_cursor': next_cursor, 'has_more': more, 'complete': complete,
+                    'read_at': time.time()}
 
     def activate(self, payload):
         with self._lock:

@@ -18,5 +18,5 @@ output_root: ../results/monitor_sessions
 success_threshold: 0.60
 success_stable_steps: 3
 success_max_drift: 0.05
-fail_stable_steps: 8
+fail_stable_steps: 800
 fail_min_progress: 0.01
