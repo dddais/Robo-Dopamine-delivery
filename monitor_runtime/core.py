@@ -39,8 +39,11 @@ class MonitorState:
     success_counter: int = 0
     fail_counter: int = 0
     progress_difference_threshold: float | None = None
+    continuous_monitoring: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.continuous_monitoring) is not bool:
+            raise ValueError("continuous_monitoring must be boolean")
         threshold = self.progress_difference_threshold
         if threshold is not None and (not math.isfinite(threshold) or not 0 <= threshold <= 1):
             raise ValueError("progress_difference_threshold must be finite and in [0, 1]")
@@ -52,15 +55,18 @@ class MonitorState:
         self.fail_counter = 0
 
     def update(self, fused_progress: float, *, progress_difference: float | None = None) -> str:
-        if self.status != MONITOR_STATUS_RUNNING:
+        if self.is_finished:
             return self.status
 
         if self.progress_difference_threshold is not None:
             if progress_difference is None or not math.isfinite(progress_difference):
                 raise ValueError("Dual-branch monitoring requires a finite progress_difference")
 
+        self.status = MONITOR_STATUS_RUNNING
         fused_progress = clamp(float(fused_progress), 0.0, 1.0)
         self.progress_history.append(fused_progress)
+        if self.continuous_monitoring:
+            self.progress_history = self.progress_history[-max(self.success_stable_steps, self.fail_stable_steps):]
 
         # A disagreement veto takes precedence even when this step would satisfy success.
         if (self.progress_difference_threshold is not None
@@ -96,7 +102,7 @@ class MonitorState:
 
     @property
     def is_finished(self) -> bool:
-        return self.status in (MONITOR_STATUS_SUCCESS, MONITOR_STATUS_FAIL)
+        return not self.continuous_monitoring and self.status in (MONITOR_STATUS_SUCCESS, MONITOR_STATUS_FAIL)
 
 
 @dataclass

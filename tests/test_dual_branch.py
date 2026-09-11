@@ -183,6 +183,28 @@ class DualBranchTests(unittest.TestCase):
                          Path(self.current['cam_high']).read_bytes())
         self.backend._snapshot_current.assert_not_called()
 
+    def test_forward_only_scores_and_difference_use_one_sample_per_branch(self):
+        self.backend.active_modes = ['forward']
+        self.steering.scores.update(forward=40, incremental=100)
+        self.baseline.scores.update(forward=50, incremental=-100)
+        first = self.run_step()
+        self.assertEqual(set(first['modes']), {'forward'})
+        self.assertAlmostEqual(first['progress'], .4)
+        self.assertAlmostEqual(first['branches']['baseline']['progress'], .5)
+        self.assertAlmostEqual(first['comparison']['difference'], .1)
+        self.assertEqual(first['status'], 'running')
+        self.capture('second')
+        self.steering.scores['forward'] = 10
+        second = self.run_step()
+        self.assertAlmostEqual(second['progress'], .1)
+        self.assertAlmostEqual(second['comparison']['difference'], .4)
+        self.assertEqual(second['status'], 'failed')
+        self.assertEqual(second['failure_reason'], 'branch_difference_exceeded')
+        for model in (self.steering, self.baseline):
+            for samples in model.calls:
+                self.assertEqual([s['eval_mode'] for s in samples], ['forward'])
+                self.assertEqual(samples[0]['image'][2:5], list(self.reference.values()))
+
     def test_difference_failure_exposed_in_http_and_log(self):
         self.steering.scores.update(forward=90, incremental=90)
         self.state.monitor.success_stable_steps = 1
@@ -398,6 +420,25 @@ class DualBranchTests(unittest.TestCase):
 
 
 class DualBranchCLITests(unittest.TestCase):
+    def test_mode_flags_yaml_defaults_and_cli_overrides_reach_backend(self):
+        cases = [({}, [], ['forward', 'incremental', 'backward']),
+                 ({'no_backward': True}, [], ['forward', 'incremental']),
+                 ({'no_incremental': True}, [], ['forward', 'backward']),
+                 ({'no_backward': True, 'no_incremental': True}, [], ['forward']),
+                 ({}, ['--no-backward', '--no-incremental'], ['forward']),
+                 ({'no_backward': True, 'no_incremental': True}, ['--incremental'], ['forward', 'incremental']),
+                 ({'no_backward': True, 'no_incremental': True}, ['--backward'], ['forward', 'backward'])]
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'monitor.yaml'
+            for defaults, flags, expected in cases:
+                with self.subTest(defaults=defaults, flags=flags):
+                    config.write_text(json.dumps({'backend': 'grm', **defaults}))
+                    with patch('monitor_runtime.grm_backend.GRMMonitorBackend') as loader, patch('uvicorn.run'):
+                        self.assertEqual(main(['--config', str(config), *flags]), 0)
+                    self.assertEqual(loader.call_args.kwargs['active_modes'], expected)
+        with self.assertRaisesRegex(ValueError, 'no_incremental must be boolean'):
+            _build_argparser({'no_incremental': 'false'})
+
     def test_yaml_and_cli_override_and_main_wiring(self):
         parser = _build_argparser({'dual_branch': True, 'progress_difference_threshold': .3})
         self.assertTrue(parser.parse_args([]).dual_branch)

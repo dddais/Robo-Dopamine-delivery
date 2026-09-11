@@ -40,8 +40,10 @@ goal_image: /home/dais/workspace/Robo-Dopamine-delivery/examples/blank_goal.png
 # fisheye_config: /path/to/fisheye_process/config.yaml
 fisheye_config: null
 
-# 是否禁用 backward 模式 (禁用后只跑 forward + incremental)
+# 是否禁用 backward 模式
 no_backward: true
+# 同时禁用 incremental 时只跑 forward；默认保留 forward + incremental
+no_incremental: false
 
 # 后台推理节拍 (秒)。GRM 在独立线程按此间隔持续推理, poll 只读最新结果
 interval: 0.1
@@ -55,7 +57,7 @@ cuda_visible_devices: null
 # 融合进度超过 success_threshold 且连续 success_stable_steps 步内
 # 波动 (max-min) <= success_max_drift -> 判 success
 success_threshold: 0.60
-success_stable_steps: 3
+success_stable_steps: 80
 success_max_drift: 0.05
 # 融合度长期低于阈值且连续 fail_stable_steps 步内
 # 每步增量都 < fail_min_progress (即平台期) -> 判 failed

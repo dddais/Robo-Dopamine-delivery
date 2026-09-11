@@ -369,6 +369,13 @@ def _build_argparser(config: dict[str, Any]) -> argparse.ArgumentParser:
     )
     parser.add_argument("--backward", dest="no_backward", action="store_false", default=argparse.SUPPRESS,
                         help="Enable backward mode, overriding no_backward in YAML.")
+    no_incremental = cfg("no_incremental", False)
+    if not isinstance(no_incremental, bool):
+        raise ValueError("no_incremental must be boolean")
+    parser.add_argument("--no-incremental", action="store_true", default=no_incremental,
+                        help="Exclude incremental mode; combine with --no-backward for forward only.")
+    parser.add_argument("--incremental", dest="no_incremental", action="store_false", default=argparse.SUPPRESS,
+                        help="Enable incremental mode, overriding no_incremental in YAML.")
     parser.add_argument(
         "--success-threshold",
         type=float,
@@ -456,7 +463,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.fisheye_config:
             fisheye_remap = init_fisheye_remap(args.fisheye_config)
 
-        active_modes = [m for m in VALID_MODES if not (args.no_backward and m == "backward")]
+        active_modes = [m for m in VALID_MODES
+                        if not (args.no_backward and m == "backward")
+                        and not (args.no_incremental and m == "incremental")]
 
         backend = GRMMonitorBackend(
             model_path=args.model_path,

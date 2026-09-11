@@ -59,6 +59,7 @@ SAM3 返回 `status: ready`；Monitor 的 `data` 应有 `provider: grm`、`engin
 | monitor / `steering_config` | `./steering.yaml` | 加载干预配置 |
 | monitor / `goal_image` | `../examples/blank_goal.png` | 全部会话共用的参考终点；有真实完成图时可替换 |
 | monitor / `no_backward` | `true` | 默认仅运行 forward、incremental |
+| monitor / `no_incremental` | `false` | 与 `no_backward: true` 同时设为 `true` 时只运行 forward；CLI 可用 `--no-incremental --no-backward`，`--incremental` 可覆盖 YAML 恢复 incremental |
 | monitor / `interval` | `0.1` 秒 | 单、双分支 YAML 均减少轮间空等；每轮工作结束后等待，代码最低取 0.1 秒，不是总推理周期 |
 | monitor / `observation_timeout` | `3.0` 秒 | 单次 Robot Runtime HTTP 请求超时 |
 | monitor / `max_camera_skew_s` | `0.25` 秒（代码默认，YAML 未写） | 三路响应都有时间戳时允许的最大时间差 |

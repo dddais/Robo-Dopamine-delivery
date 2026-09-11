@@ -514,6 +514,7 @@ class GRMMonitorBackend:
                 'progress_percent':fused*100,'status':status,'modes':mode_results,'frames':current,
                 'subtask':state.subtask,'subtask_idx':state.subtask_index or 0,
                 'inference_updated_at':now,'observation':observation,'engine':self.inference_engine,
+                'continuous_monitoring':state.monitor.continuous_monitoring,
                 'latency_s':time.monotonic()-started,
                 'timing':{'observation_ms':observation_ms,'queue_wait_ms':queue_ms,
                           'prepare_ms':sum(v['steering'].get('prepare_ms',0) for v in timing_modes),
@@ -607,15 +608,18 @@ class GRMMonitorBackend:
         deferred = payload.get('defer_inference', False)
         if not isinstance(deferred, bool):
             raise ValueError('defer_inference must be boolean')
+        continuous = payload.get('continuous_monitoring', False)
+        if type(continuous) is not bool:
+            raise ValueError('continuous_monitoring must be boolean')
         queries=target_queries(task,payload.get('target_queries'),self.steering.get('task_queries')) if self.steering['enabled'] else []
         with self._lock:
             previous=self.sessions.get(mid)
             if previous is not None:
-                if (previous.execution_id,previous.subtask,previous.queries,previous.subtask_index,previous.defer_inference)!=(execution,task,queries,payload.get('subtask_index'),deferred):
+                if (previous.execution_id,previous.subtask,previous.queries,previous.subtask_index,previous.defer_inference,previous.monitor.continuous_monitoring)!=(execution,task,queries,payload.get('subtask_index'),deferred,continuous):
                     raise MonitorConflict('monitor_id already belongs to a different request')
                 return self.status({'monitor_id':mid})
             state=_SubtaskState(mid,execution,task,subtask_index=payload.get('subtask_index'),queries=queries,
-                                monitor=MonitorState(**self.monitor_options), defer_inference=deferred)
+                                monitor=MonitorState(**self.monitor_options, continuous_monitoring=continuous), defer_inference=deferred)
             if not deferred:
                 state.inference_event.set()
             directory=self._session_dir(state);directory.mkdir(parents=True)
@@ -626,7 +630,7 @@ class GRMMonitorBackend:
                 branch_manifest = {'dual_branch': self._dual_branch_options(),
                                    'baseline_runtime': getattr(baseline_runtime, 'manifest', {})}
             (directory/'manifest.json').write_text(json.dumps({'monitor_id':mid,'execution_id':execution,'subtask':task,
-                'target_queries':queries,'defer_inference':deferred,'generation':state.generation,'runtime':runtime,'active_modes':self.active_modes,
+                'target_queries':queries,'defer_inference':deferred,'continuous_monitoring':continuous,'generation':state.generation,'runtime':runtime,'active_modes':self.active_modes,
                 'monitor_options':self.monitor_options,'tracking':self.tracking_config, **branch_manifest},indent=2))
             self.sessions[mid]=state
             self._record_journals[mid] = (execution, state.generation, directory, task)
@@ -647,6 +651,7 @@ class GRMMonitorBackend:
             result={'provider':'grm','warming_up':state.ref_start is None or bool(
                         tracking and not tracking['ready'] and not state.monitor.is_finished),
                     'inference_enabled':state.inference_event.is_set(),**latest,
+                    'continuous_monitoring':state.monitor.continuous_monitoring,
                     'result_age_s':time.time()-updated,'session_dir':str(self._session_dir(state))}
             if tracking:
                 result['tracking'] = tracking
@@ -657,7 +662,7 @@ class GRMMonitorBackend:
             if state.monitor.is_finished:
                 result.update(final_status=state.monitor.status,progress_history=list(state.monitor.progress_history))
             return MonitorSession(state.monitor_id,state.execution_id,state.subtask,state.subtask_index,
-                status=state.monitor.status,progress=latest.get('progress',0.),created_at=state.created_at,
+                status='running' if state.monitor.continuous_monitoring else state.monitor.status,progress=latest.get('progress',0.),created_at=state.created_at,
                 updated_at=updated,error=state.error,poll_count=state.step,result=result,
                 message='grm monitor backend')
 

@@ -6,7 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from PIL import Image
@@ -261,6 +261,15 @@ class MonitorTests(unittest.TestCase):
         self.backend._snapshot_current=lambda *a,**kw:(duplicate,{'identity':'new'})
         self.assertIsNone(self.backend._run_one_step(self.state))
         self.assertEqual(self.state.step,1)
+    def test_forward_only_single_branch_submits_one_sample(self):
+        self.backend.active_modes = ['forward']
+        infer = Mock(wraps=self.model.inference_batch)
+        self.model.inference_batch = infer
+        record = self.backend._run_one_step(self.state)
+        self.assertEqual([s['eval_mode'] for s in infer.call_args.args[0]], ['forward'])
+        self.assertEqual(set(record['modes']), {'forward'})
+        self.assertAlmostEqual(record['progress'], .2)
+        self.assertEqual(infer.call_args.args[0][0]['image'][2:5], list(self.ref.values()))
     def test_preview_is_exact_committed_input_and_survives_stop(self):
         record = self.backend._run_one_step(self.state)
         frame_id = record['preview']['frame_set_id']
