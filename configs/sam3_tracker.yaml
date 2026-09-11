@@ -2,7 +2,7 @@
 host: 127.0.0.1
 port: 8878
 model_path: /home/dais/workspace/model/sam3
-device: cuda:0
+device: cuda:3
 dtype: bfloat16
 bbox_only: true
 num_threads: 4
@@ -12,9 +12,10 @@ tracking:
   enabled: true
   device: cuda:0
   dtype: bfloat16
-  redetect_interval_s: 5.0
+  # Detect only on the first task frame. Any loss stays missing until a new task.
   max_gap_s: 2.0
   min_score: 0.5
+  # Consecutive accepted boxes must overlap; reject abrupt instance jumps.
   match_iou: 0.1
   memory_frames: 32
   session_ttl_s: 60.0

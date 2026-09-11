@@ -1,4 +1,4 @@
-"""Session isolation, loss/reacquisition, exact-frame handoff and bounded buffering."""
+"""Instance locking, terminal loss, exact-frame handoff and bounded buffering."""
 from copy import deepcopy
 from pathlib import Path
 import queue
@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 from PIL import Image
 
 from grm_runtime.common import file_sha
-from grm_runtime.grounding import AlignmentError, GroundingClient, validate_grounding_result
+from grm_runtime.grounding import AlignmentError, GroundingClient, GroundingError, validate_grounding_result
 from monitor_runtime.tracking import LatestTrackedFrames
 from sam3_runtime.service import make_server
 from sam3_runtime.tracker import TrackingEngine, normalize_tracker_feature_names
@@ -31,9 +31,19 @@ class EngineTests(unittest.TestCase):
         self.tracker = SimpleNamespace(initialize=Mock(return_value=object()), step=Mock(return_value=candidate()))
         self.engine = TrackingEngine(self.detector, self.tracker)
         self.image = Image.new('RGB', (32, 24))
+        self.started = set()
 
     def update(self, sha='first', session='a'):
-        return self.engine.update(session, self.image, ['pen'], sha)
+        initialize = session not in self.started
+        self.started.add(session)
+        return self.engine.update(session, self.image, ['pen'], sha, initialize=initialize)
+
+    def assert_lost(self, result, reason):
+        self.assertIsNone(result['selected'])
+        self.assertEqual(result['candidates'], [])
+        self.assertEqual(result['status'], 'no_detection')
+        self.assertEqual(result['tracking_state'], 'lost')
+        self.assertEqual(result['loss_reason'], reason)
 
     def test_detect_once_track_next_and_duplicate_is_idempotent(self):
         self.assertEqual(self.update()['source'], 'sam3_detection')
@@ -44,6 +54,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.detector.detect.call_count, 1)
         self.assertEqual(self.tracker.initialize.call_count, 1)
         self.assertEqual(self.tracker.step.call_count, 1)
+        self.assertEqual(result['identity_policy'], 'initial_instance')
 
     def test_ambiguous_first_frame_does_not_choose_an_instance(self):
         self.detector.detect.return_value = [candidate(), candidate([16, 3, 24, 12], .89)]
@@ -51,47 +62,142 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result['selection_status'], 'ambiguous')
         self.assertIsNone(result['selected'])
         self.tracker.initialize.assert_not_called()
+        # Once the scene changes, a remaining pen must not resolve the initial
+        # ambiguity by becoming the only candidate.
+        self.detector.detect.return_value = [candidate([16, 3, 24, 12])]
+        self.assert_lost(self.update('remaining-pen'), 'ambiguous')
+        self.detector.detect.assert_called_once()
 
-    def test_loss_never_reuses_old_bbox_and_reacquires(self):
-        self.update()
-        self.tracker.step.return_value = None
+    def test_no_initial_detection_cannot_bind_a_later_scene(self):
         self.detector.detect.return_value = []
-        result = self.update('lost')
-        self.assertIsNone(result['selected'])
-        self.assertIsNone(self.engine.sessions['a'].session)
+        self.assert_lost(self.update(), 'no_detection')
         self.detector.detect.return_value = [candidate()]
-        self.assertIsNotNone(self.update('found')['selected'])
-        self.assertEqual(self.tracker.initialize.call_count, 2)
+        self.assert_lost(self.update('later'), 'no_detection')
+        self.detector.detect.assert_called_once()
+        self.tracker.initialize.assert_not_called()
 
-    def test_periodic_detection_matches_current_instance_not_highest_score(self):
+    def test_left_pen_lost_never_switches_to_remaining_pen_or_reacquires(self):
+        left, right = candidate(), candidate([18, 3, 25, 12], .99)
+        left['query'] = right['query'] = 'left pen'
+        self.detector.detect.return_value = [left]
+        first = self.engine.update('left-task', self.image, ['left pen'], 'initial', initialize=True)
+        self.assertEqual(first['selected'], left)
+        self.tracker.step.return_value = None
+        self.detector.detect.return_value = [right]
+        for sha in ('occluded', 'remaining-pen', 'initial'):
+            self.assert_lost(self.engine.update('left-task', self.image, ['left pen'], sha), 'empty_mask')
+        # Even if the tracker could output a box again, it may be a different
+        # instance: never resume a trajectory after confidence was lost.
+        self.tracker.step.return_value = right
+        self.assert_lost(self.engine.update('left-task', self.image, ['left pen'], 'later'), 'empty_mask')
+        self.detector.detect.assert_called_once()
+        self.tracker.initialize.assert_called_once()
+        self.tracker.step.assert_called_once()
+
+    def test_low_confidence_loss_is_terminal(self):
         self.update()
-        self.engine.sessions['a'].detected_at = 90.
-        self.detector.detect.return_value = [candidate([18, 3, 25, 12], .99), candidate()]
-        result = self.update('periodic')
-        self.assertEqual(result['selected']['bbox'], candidate()['bbox'])
-        self.assertEqual(result['source'], 'sam3_detection')
+        self.tracker.step.return_value = candidate(score=.49)
+        self.assert_lost(self.update('lost'), 'low_score')
+        self.assertIsNone(self.engine.sessions['a'].session)
+        self.tracker.step.return_value = candidate(score=1.)
+        self.assert_lost(self.update('found'), 'low_score')
+        self.detector.detect.assert_called_once()
+        self.tracker.initialize.assert_called_once()
 
-    def test_gap_expiry_target_changes_and_close(self):
+    def test_nonfinite_presence_is_not_a_valid_target(self):
+        self.update()
+        self.tracker.step.return_value = candidate(score=float('nan'))
+        self.assert_lost(self.update('invalid'), 'low_score')
+
+    def test_confident_tracker_jump_is_rejected_and_never_resumed(self):
+        self.update()
+        self.tracker.step.return_value = candidate([18, 3, 25, 12], 1.)
+        self.assert_lost(self.update('other-pen'), 'discontinuous_bbox')
+        self.tracker.step.return_value = candidate()
+        self.assert_lost(self.update('original-pen'), 'discontinuous_bbox')
+        self.tracker.step.assert_called_once()
+
+    def test_moving_original_instance_retains_query_and_memory(self):
+        self.update()
+        session = self.engine.sessions['a'].session
+        self.tracker.step.return_value = {**candidate([3, 2, 11, 11]), 'query': 'irrelevant'}
+        result = self.update('lifted')
+        self.assertEqual(result['selected']['bbox'], [3, 2, 11, 11])
+        self.assertEqual(result['selected']['query'], 'pen')
+        self.assertIs(self.engine.sessions['a'].session, session)
+
+    def test_periodic_text_mismatch_cannot_reset_healthy_tracking(self):
+        # Old YAML remains loadable, but its redetection interval is retired.
+        self.engine = TrackingEngine(self.detector, self.tracker, redetect_interval_s=5.)
+        self.update()
+        for second in range(1, 12):
+            self.now.return_value = 100. + second
+            self.detector.detect.return_value = [] if second % 2 else [candidate([18, 3, 25, 12], .99)]
+            result = self.update(f'frame-{second}')
+            self.assertEqual(result['selected']['bbox'], candidate()['bbox'])
+            self.assertEqual(result['source'], 'sam3_tracker')
+            self.assertEqual(result['tracker_frame_index'], second)
+        self.detector.detect.assert_called_once()
+        self.tracker.initialize.assert_called_once()
+
+    def test_gap_invalidates_cached_box_and_cannot_reinitialize(self):
         self.update()
         self.now.return_value = 104.
-        self.update('after-gap')
+        self.assert_lost(self.update('first'), 'update_gap')
+        self.assert_lost(self.update('after-gap'), 'update_gap')
         self.tracker.step.assert_not_called()
-        self.assertEqual(self.tracker.initialize.call_count, 2)
-        with self.assertRaises(ValueError):
-            self.engine.update('a', self.image, ['carrot'], 'wrong-task')
-        self.update('first', 'b')
-        self.engine.close('a')
-        self.assertEqual(set(self.engine.sessions), {'b'})
+        self.tracker.initialize.assert_called_once()
+
+    def test_expired_closed_or_unknown_continuation_never_detects(self):
+        self.update()
         self.now.return_value = 200.
         self.engine.expire()
         self.assertFalse(self.engine.sessions)
+        self.assert_lost(self.update('expired'), 'session_missing')
+        self.update('initial', 'new-task')
+        self.engine.close('new-task')
+        self.assert_lost(self.update('closed', 'new-task'), 'session_missing')
+        self.assert_lost(self.engine.update('unknown', self.image, ['pen'], 'frame'), 'session_missing')
+        self.assertFalse(self.engine.sessions)
+        self.assertEqual(self.detector.detect.call_count, 2)
 
-    def test_partial_tracker_failure_discards_session(self):
+    def test_target_size_changes_and_new_task_isolation(self):
+        self.update()
+        with self.assertRaises(ValueError):
+            self.engine.update('a', self.image, ['carrot'], 'wrong-task')
+        with self.assertRaises(ValueError):
+            self.engine.update('a', Image.new('RGB', (64, 48)), ['pen'], 'wrong-size')
+        self.update('first', 'b')
+        self.engine.close('a')
+        self.assertEqual(set(self.engine.sessions), {'b'})
+        self.assertEqual(self.detector.detect.call_count, 2)
+
+    def test_partial_tracker_failure_releases_gpu_but_keeps_terminal_identity(self):
         self.update()
         self.tracker.step.side_effect = RuntimeError('GPU failed')
         with self.assertRaises(RuntimeError):
             self.update('next')
-        self.assertNotIn('a', self.engine.sessions)
+        self.assertIsNone(self.engine.sessions['a'].session)
+        self.assert_lost(self.update('first'), 'inference_error')
+        self.assert_lost(self.update('retry'), 'inference_error')
+        self.detector.detect.assert_called_once()
+        self.tracker.initialize.assert_called_once()
+
+    def test_failed_initialization_cannot_bind_a_second_target(self):
+        self.tracker.initialize.side_effect = RuntimeError('GPU failed')
+        with self.assertRaises(RuntimeError):
+            self.update()
+        self.tracker.initialize.side_effect = None
+        self.detector.detect.return_value = [candidate([18, 3, 25, 12])]
+        self.assert_lost(self.update('retry'), 'inference_error')
+        self.detector.detect.assert_called_once()
+
+    def test_repeated_initialize_flag_does_not_reset_a_lost_task(self):
+        self.update()
+        self.tracker.step.return_value = None
+        self.assert_lost(self.update('lost'), 'empty_mask')
+        self.assert_lost(self.engine.update('a', self.image, ['pen'], 'retry', initialize=True), 'empty_mask')
+        self.detector.detect.assert_called_once()
 
     def test_feature_alias_preserves_tensors_and_existing_fields(self):
         tensor = object()
@@ -130,6 +236,75 @@ class ProtocolTests(unittest.TestCase):
             validate_grounding_result(result, 'old-frame', (32,24), ['pen'])
         with self.assertRaises(AlignmentError):
             validate_grounding_result(result, file_sha(self.path), (32,24), ['carrot'])
+
+    def next_frame(self):
+        Image.new('RGB', (32, 24), 'red').save(self.path)
+
+    def test_http_loss_publishes_empty_current_frame_and_new_task_can_bind(self):
+        self.client.track(self.path, ['pen'], 'a')
+        self.engine.tracker.step = Mock(return_value=None)
+        self.engine.detector.detect.return_value = [candidate([18, 3, 25, 12])]
+        self.next_frame()
+        for _ in range(2):
+            result = self.client.track(self.path, ['pen'], 'a')
+            self.assertIsNone(result['selected'])
+            self.assertEqual(result['selection_status'], 'tracking_lost')
+            self.assertEqual(result['loss_reason'], 'empty_mask')
+            self.assertEqual(result['image_sha256'], file_sha(self.path))
+        self.engine.detector.detect.assert_called_once()
+        result = self.client.track(self.path, ['pen'], 'new-task')
+        self.assertEqual(result['selected']['bbox'], [18, 3, 25, 12])
+
+    def test_server_state_loss_and_close_do_not_reinitialize_old_tasks(self):
+        for session in ('expired-task', 'closed-task'):
+            self.client.track(self.path, ['pen'], session)
+            if session == 'expired-task':
+                self.engine.sessions[session].seen_at = 0.
+                self.engine.expire()
+            else:
+                self.client.close_track(session)
+            result = self.client.track(self.path, ['pen'], session)
+            self.assertEqual(result['loss_reason'], 'session_missing')
+            self.assertIsNone(result['selected'])
+        self.engine.sessions.clear()  # Same lost-state condition as a service restart.
+        result = self.client.track(self.path, ['pen'], 'expired-task')
+        self.assertIsNone(result['selected'])
+        self.assertEqual(self.engine.detector.detect.call_count, 2)
+        self.assertFalse(self.engine.sessions)
+
+    def test_lost_first_request_is_not_retried_as_a_new_initialization(self):
+        with patch.object(self.client, '_request', side_effect=GroundingError('connection failed')):
+            with self.assertRaises(GroundingError):
+                self.client.track(self.path, ['pen'], 'a')
+        result = self.client.track(self.path, ['pen'], 'a')
+        self.assertIsNone(result['selected'])
+        self.assertEqual(result['loss_reason'], 'session_missing')
+        self.engine.detector.detect.assert_not_called()
+
+    def test_lost_first_response_keeps_the_existing_instance(self):
+        request = self.client._request
+        def drop_response(route, payload):
+            request(route, payload)
+            raise GroundingError('response lost after initialization')
+        with patch.object(self.client, '_request', side_effect=drop_response):
+            with self.assertRaises(GroundingError):
+                self.client.track(self.path, ['pen'], 'a')
+        self.engine.detector.detect.return_value = [candidate([18, 3, 25, 12])]
+        self.next_frame()
+        result = self.client.track(self.path, ['pen'], 'a')
+        self.assertEqual(result['selected']['bbox'], candidate()['bbox'])
+        self.assertEqual(result['source'], 'sam3_tracker')
+        self.engine.detector.detect.assert_called_once()
+
+    def test_old_server_without_identity_policy_is_rejected(self):
+        request = self.client._request
+        def old_server(route, payload):
+            result = request(route, payload)
+            result.pop('identity_policy')
+            return result
+        with patch.object(self.client, '_request', side_effect=old_server):
+            with self.assertRaisesRegex(AlignmentError, 'initial-instance locking'):
+                self.client.track(self.path, ['pen'], 'a')
 
 
 class LatestSlotTests(unittest.TestCase):

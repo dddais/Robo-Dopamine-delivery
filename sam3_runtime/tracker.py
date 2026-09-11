@@ -8,6 +8,10 @@ import time
 from types import MethodType
 
 from grm_runtime.common import fingerprint
+from grm_runtime.grounding import validate_bbox
+
+
+IDENTITY_POLICY = 'initial_instance'
 
 
 def box_iou(a, b):
@@ -91,31 +95,44 @@ class Track:
     queries: tuple
     size: tuple
     seen_at: float
-    detected_at: float = 0.
     session: object = None
     index: int = 0
+    query: str | None = None
+    last_box: list | None = None
+    loss_reason: str | None = None
     last_sha: str | None = None
     last_result: dict | None = None
 
 
 class TrackingEngine:
-    """Called under the service GPU lock. Results are never cached across sessions."""
-    def __init__(self, detector, tracker, *, redetect_interval_s=5., max_gap_s=2.,
+    """Bind once per task. Loss is terminal; only an explicit new task may detect.
+
+    Called under the service GPU lock. A continuation can never create a session,
+    including after TTL expiry or a service restart.
+    """
+    identity_policy = IDENTITY_POLICY
+
+    def __init__(self, detector, tracker, *, redetect_interval_s=None, max_gap_s=2.,
                  min_score=.5, match_iou=.1, session_ttl_s=60., max_sessions=8):
-        values = (redetect_interval_s, max_gap_s, session_ttl_s, min_score, match_iou)
+        # Accept old deployment YAMLs, but never re-enable text redetection.
+        if redetect_interval_s is not None and (isinstance(redetect_interval_s, bool)
+                or not isinstance(redetect_interval_s, (int, float))
+                or not math.isfinite(redetect_interval_s) or redetect_interval_s <= 0):
+            raise ValueError("Invalid legacy redetect_interval_s")
+        values = (max_gap_s, session_ttl_s, min_score, match_iou)
         if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in values):
             raise ValueError("Invalid tracking thresholds")
-        if min(redetect_interval_s, max_gap_s, session_ttl_s) <= 0 or not 0 <= min_score <= 1 or not 0 <= match_iou <= 1:
+        if min(max_gap_s, session_ttl_s) <= 0 or not 0 <= min_score <= 1 or not 0 < match_iou <= 1:
             raise ValueError("Invalid tracking thresholds")
         if isinstance(max_sessions, bool) or not isinstance(max_sessions, int) or max_sessions < 1:
             raise ValueError("max_sessions must be positive")
         self.detector, self.tracker = detector, tracker
-        self.redetect_interval_s, self.max_gap_s = redetect_interval_s, max_gap_s
+        self.max_gap_s = max_gap_s
         self.min_score, self.match_iou = min_score, match_iou
         self.session_ttl_s, self.max_sessions = session_ttl_s, max_sessions
         self.sessions = {}
-        self.fingerprint = fingerprint({"detector": detector.fingerprint, "kind": "sam3_tracker_video_v1",
-            "dtype": str(getattr(tracker, 'dtype', None)), "redetect_interval_s": redetect_interval_s,
+        self.fingerprint = fingerprint({"detector": detector.fingerprint, "kind": "sam3_tracker_video_v2",
+            "dtype": str(getattr(tracker, 'dtype', None)), "identity_policy": self.identity_policy,
             "max_gap_s": max_gap_s, "min_score": min_score, "match_iou": match_iou})
 
     def close(self, session_id):
@@ -127,66 +144,96 @@ class TrackingEngine:
             if now-state.seen_at > self.session_ttl_s:
                 del self.sessions[key]
 
-    def update(self, session_id, image, queries, sha):
+    @staticmethod
+    def _lose(state, reason):
+        # Release GPU memory without forgetting that this task already tried to
+        # bind an instance. Invalidate even duplicate-image results after loss.
+        state.session, state.loss_reason = None, reason
+        state.last_sha, state.last_result = None, None
+
+    def _result(self, row, source, state, timing, started):
+        reason = state.loss_reason
+        return {"candidates": [row] if row else [], "selected": row,
+            "status": "ok" if row else "no_detection",
+            "selection_status": "ok" if row else reason if reason in {'ambiguous', 'no_detection'} else 'tracking_lost',
+            "tracking_state": "tracking" if row else "lost", "loss_reason": reason,
+            "identity_policy": self.identity_policy,
+            "source": source, "score_type": "object_presence" if source == 'sam3_tracker' else "detection",
+            "tracker_frame_index": state.index, "timing": timing,
+            "latency_ms": (time.monotonic()-started)*1000}
+
+    def update(self, session_id, image, queries, sha, *, initialize=False):
+        if not isinstance(initialize, bool):
+            raise ValueError('initialize must be boolean and true only on the first task request')
         self.expire()
         now, started = time.monotonic(), time.monotonic()
+        timing = {"tracker_ms": 0., "detect_ms": 0.}
         state = self.sessions.get(session_id)
         if state is not None and (state.queries != tuple(queries) or state.size != image.size):
             raise ValueError("Tracking session target/size changed; start a new session")
-        if state is None:
+        first = state is None
+        if first:
+            if not initialize:
+                # No tombstone registry is needed: continuations fail closed
+                # when GPU sessions are expired, closed, or lost on restart.
+                return self._result(None, 'sam3_tracker',
+                    Track(tuple(queries), image.size, now, loss_reason='session_missing'), timing, started)
             if len(self.sessions) >= self.max_sessions:
                 raise ValueError("Too many tracking sessions; close inactive sessions")
             state = Track(tuple(queries), image.size, now)
             self.sessions[session_id] = state
         gap = now-state.seen_at
         state.seen_at = now
-        if gap <= self.max_gap_s and state.last_sha == sha and state.last_result is not None:
+        if state.loss_reason is None and gap > self.max_gap_s:
+            self._lose(state, 'update_gap')
+        if state.loss_reason is None and state.last_sha == sha and state.last_result is not None:
             return deepcopy(state.last_result)
-        if gap > self.max_gap_s:
-            state.session = None
-        row, source, reason = None, 'sam3_tracker', None
-        timing = {"tracker_ms": 0., "detect_ms": 0.}
+        row, source = None, 'sam3_tracker'
         try:
-            if state.session is not None:
+            if state.loss_reason is not None:
+                pass  # Missing forever in this task; never return an old box.
+            elif first:
+                source = 'sam3_detection'
+                tick = time.monotonic()
+                candidates = sorted(self.detector.detect(image, queries), key=lambda c: -c['score'])
+                timing['detect_ms'] = (time.monotonic()-tick)*1000
+                timing['detector'] = deepcopy(getattr(self.detector, 'last_timing', {}))
+                ambiguous = len(candidates) > 1 and candidates[1]['score'] >= candidates[0]['score']-.05
+                if not candidates or ambiguous:
+                    self._lose(state, 'ambiguous' if ambiguous else 'no_detection')
+                else:
+                    row = candidates[0]
+                    box = validate_bbox(row['bbox'], image.size)
+                    if row['query'] not in queries or not math.isfinite(row['score']) or not 0 <= row['score'] <= 1:
+                        raise ValueError('Invalid initial detection score/query')
+                    row = {**row, 'bbox': box}
+                    tick = time.monotonic()
+                    state.session = self.tracker.initialize(image, box)
+                    timing['tracker_ms'] += (time.monotonic()-tick)*1000
+                    state.query, state.last_box = row['query'], list(box)
+            else:
                 tick = time.monotonic()
                 state.index += 1
                 row = self.tracker.step(state.session, image, state.index)
                 timing['tracker_ms'] += (time.monotonic()-tick)*1000
-                if row is not None and row['score'] >= self.min_score:
-                    row = {**row, 'query': state.last_result['selected']['query']}
+                if row is None:
+                    self._lose(state, 'empty_mask')
+                elif not math.isfinite(row['score']) or not self.min_score <= row['score'] <= 1:
+                    self._lose(state, 'low_score')
                 else:
-                    row, state.session = None, None
-            if state.session is None or now-state.detected_at >= self.redetect_interval_s:
-                source = 'sam3_detection'
-                tick = time.monotonic()
-                candidates = self.detector.detect(image, queries)
-                timing['detect_ms'] = (time.monotonic()-tick)*1000
-                timing['detector'] = deepcopy(getattr(self.detector, 'last_timing', {}))
-                if row is not None:
-                    candidates = [c for c in candidates if box_iou(c['bbox'], row['bbox']) >= self.match_iou]
-                    candidates.sort(key=lambda c: box_iou(c['bbox'], row['bbox']), reverse=True)
-                else:
-                    candidates = sorted(candidates, key=lambda c: -c['score'])
-                # A tracker does not resolve ambiguous first-frame detections.
-                ambiguous = row is None and len(candidates) > 1 and candidates[1]['score'] >= candidates[0]['score']-.05
-                if candidates and not ambiguous:
-                    row = candidates[0]
-                    tick = time.monotonic()
-                    state.session = self.tracker.initialize(image, row['bbox'])
-                    timing['tracker_ms'] += (time.monotonic()-tick)*1000
-                    state.index, state.detected_at = 0, now
-                    source = 'sam3_detection'
-                else:
-                    row, state.session = None, None
-                    reason = 'ambiguous' if ambiguous else 'no_detection'
-            result = {"candidates": [row] if row else [], "selected": row,
-                "status": "ok" if row else "no_detection", "selection_status": "ok" if row else reason,
-                "source": source, "score_type": "object_presence" if source == 'sam3_tracker' else "detection",
-                "tracker_frame_index": state.index, "timing": timing,
-                "latency_ms": (time.monotonic()-started)*1000}
+                    box = validate_bbox(row['bbox'], image.size)
+                    if box_iou(box, state.last_box) < self.match_iou:
+                        self._lose(state, 'discontinuous_bbox')
+                    else:
+                        row = {**row, 'bbox': box, 'query': state.query}
+                        state.last_box = list(box)
+                if state.loss_reason is not None:
+                    row = None
+            result = self._result(row, source, state, timing, started)
             state.last_sha, state.last_result = sha, deepcopy(result)
             return result
         except Exception:
-            # An HTTP retry must never propagate from partially advanced GPU state.
-            self.close(session_id)
+            # Drop partially advanced GPU state, but keep the task terminal so
+            # an HTTP retry cannot bind a different instance.
+            self._lose(state, 'inference_error')
             raise

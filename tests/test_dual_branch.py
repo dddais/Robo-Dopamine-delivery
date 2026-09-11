@@ -162,6 +162,27 @@ class DualBranchTests(unittest.TestCase):
         self.assertEqual(second['timing']['grm_ms'], 40)
         self.assertEqual(self.state.tracker.counts, self.state.baseline_tracker.counts)
 
+    def test_lost_target_is_shared_by_both_modes_and_branches_without_fresh_detection(self):
+        from grm_runtime.common import file_sha
+        grounding = {'after_cam_high': {
+            'image_sha256': file_sha(self.current['cam_high']), 'image_size': [32, 32],
+            'coordinate_space': 'input_image_xyxy', 'status': 'no_detection',
+            'selected': None, 'candidates': [], 'selection_status': 'tracking_lost',
+            'tracking_state': 'lost', 'loss_reason': 'empty_mask', 'source': 'sam3_tracker'}}
+        self.state.tracking_stream = SimpleNamespace(
+            read=Mock(return_value=(self.current, {'identity': 'lost-target'}, grounding)),
+            close=Mock(), status=lambda: {'ready': True})
+        self.backend._snapshot_current = Mock(side_effect=AssertionError('must retain the tracked image/result pair'))
+        record = self.run_step()
+        for model in (self.steering, self.baseline):
+            self.assertEqual(len(model.calls[0]), 2)
+            for sample in model.calls[0]:
+                self.assertEqual(sample['online_grounding'], grounding)
+                self.assertEqual(sample['image'][5:], list(self.current.values()))
+        self.assertEqual(self.backend.frame_image(record['preview']['frame_set_id'], 'cam_high'),
+                         Path(self.current['cam_high']).read_bytes())
+        self.backend._snapshot_current.assert_not_called()
+
     def test_difference_failure_exposed_in_http_and_log(self):
         self.steering.scores.update(forward=90, incremental=90)
         self.state.monitor.success_stable_steps = 1

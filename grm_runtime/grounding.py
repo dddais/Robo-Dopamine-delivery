@@ -56,6 +56,10 @@ class GroundingClient:
         self.url, self.timeout = url.rstrip("/"), timeout_s
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self._cache = {}
+        # A Monitor creates one client per task. Retain attempted session IDs
+        # for this client's lifetime, even after errors or close, so a retry can
+        # never silently initialize from a later scene.
+        self._tracking_started = set()
         self._lock = threading.Lock()
 
     def _request(self, route, payload=None):
@@ -115,10 +119,16 @@ class GroundingClient:
         # Tracking is history-dependent. Never use the detector's content cache.
         data, size = png_bytes(path)
         sha, request_id = hashlib.sha256(data).hexdigest(), uuid4().hex
+        with self._lock:
+            initialize = session_id not in self._tracking_started
+            self._tracking_started.add(session_id)
         result = self._request('/tracking/update', {'session_id': session_id, 'request_id': request_id,
+            'initialize': initialize,
             'image_sha256': sha, 'queries': queries, 'image_png_base64': base64.b64encode(data).decode()})
         if result.get('session_id') != session_id or result.get('request_id') != request_id:
             raise AlignmentError('Tracker response belongs to a different session/request')
+        if result.get('identity_policy') != 'initial_instance':
+            raise AlignmentError('SAM3 tracker lacks initial-instance locking; restart SAM3 with the updated code')
         validate_grounding_result(result, sha, size, queries)
         return result
 
@@ -143,5 +153,5 @@ def validate_grounding_result(result, sha, size, queries):
     if selected is not None:
         if result.get('selection_status') != 'ok' or selected not in result.get('candidates', []):
             raise AlignmentError('Invalid tracked selection')
-    elif result.get('selection_status') not in {'no_detection', 'ambiguous', 'tracking_error'}:
+    elif result.get('selection_status') not in {'no_detection', 'ambiguous', 'tracking_error', 'tracking_lost'}:
         raise AlignmentError('Missing tracked selection status')

@@ -54,11 +54,11 @@ def main():
     if args.tracker or args.tracker_only:
         from sam3_runtime.tracker import SAM3VideoTracker, TrackingEngine
         tracker = SAM3VideoTracker(args.model_path, args.device)
-        engine = TrackingEngine(detector, tracker, max_gap_s=30., redetect_interval_s=60.)
+        engine = TrackingEngine(detector, tracker, max_gap_s=30.)
         rows = []
         for i in range(args.tracker_frames or len(images) * args.repeats):
             image = images[i % len(images)]
-            result = engine.update('offline-benchmark', image, [args.query], str(i))
+            result = engine.update('offline-benchmark', image, [args.query], str(i), initialize=i == 0)
             rows.append(result)
             session = engine.sessions['offline-benchmark'].session
             if session is not None:

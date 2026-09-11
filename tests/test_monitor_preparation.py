@@ -203,10 +203,14 @@ class PreparationTests(unittest.TestCase):
         self.backend.grounder.detect.assert_not_called()
         self.assertTrue(all(r['steering']['applied'] for r in output))
         self.assertTrue(all(r['steering']['grounding']['after_cam_high']['source'] == 'sam3_tracker' for r in output))
-        result.update(status='no_detection', selected=None, candidates=[], selection_status='tracking_error')
-        output = self.backend.inference_batch(samples)
-        self.assertTrue(all(r['steering']['degraded'] for r in output))
-        self.backend.grounder.detect.assert_not_called()
+        for status in ('tracking_error', 'tracking_lost'):
+            with self.subTest(status=status):
+                result.update(status='no_detection', selected=None, candidates=[], selection_status=status)
+                output = self.backend.inference_batch(samples)
+                self.assertTrue(all(r['steering']['degraded'] for r in output))
+                self.assertTrue(all(not r['steering']['applied'] for r in output))
+                self.assertTrue(all(r['steering']['reason'] == status for r in output))
+                self.backend.grounder.detect.assert_not_called()
         result['image_sha256'] = 'different-frame'
         with self.assertRaises(ValueError):
             self.backend.inference_batch(samples)

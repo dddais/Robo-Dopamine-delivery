@@ -38,6 +38,7 @@ def make_server(host, port, detector, tracker=None):
                 return self.send_json({"error": "not found"}, 404)
             self.send_json({"status": "ready", "model_fingerprint": detector.fingerprint,
                 "tracking_enabled": tracker is not None,
+                "tracking_identity_policy": tracker.identity_policy if tracker else None,
                 "tracker_fingerprint": tracker.fingerprint if tracker else None})
 
         def do_POST(self):
@@ -72,7 +73,8 @@ def make_server(host, port, detector, tracker=None):
                     image = im.convert("RGB")
                 started = time.monotonic()
                 if self.path == '/tracking/update':
-                    result = tracker.update(session_id, image, queries, sha)
+                    result = tracker.update(session_id, image, queries, sha,
+                        initialize=request.get('initialize', False))
                     return self.send_json({**result, "request_id": request["request_id"],
                         "session_id": session_id, "image_sha256": sha, "image_size": list(image.size),
                         "coordinate_space": "input_image_xyxy", "model_fingerprint": tracker.fingerprint})
