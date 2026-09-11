@@ -1,0 +1,337 @@
+{
+  "run": "/mnt/public1/dais/workspace/Robo-Dopamine-delivery/results/monitor_sessions/26-09-11-16-53-10_ba272a41",
+  "device": "cuda:0",
+  "local_files_only": true,
+  "real_model": true,
+  "steering_enabled": false,
+  "comparisons": [
+    {
+      "session": "17a50b30b9f14577b563eeb0ad67d318",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "17a50b30b9f14577b563eeb0ad67d318",
+      "step": 11,
+      "mode": "forward",
+      "recorded_pred": "<score>+45.5%</score>",
+      "replay_pred": "<score>+45.5%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "17a50b30b9f14577b563eeb0ad67d318",
+      "step": 22,
+      "mode": "forward",
+      "recorded_pred": "<score>+45.5%</score>",
+      "replay_pred": "<score>+45.5%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "19e0c66a0bc347a2b67df94915cf8817",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "19e0c66a0bc347a2b67df94915cf8817",
+      "step": 18,
+      "mode": "forward",
+      "recorded_pred": "<score>+45.5%</score>",
+      "replay_pred": "<score>+45.5%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "19e0c66a0bc347a2b67df94915cf8817",
+      "step": 35,
+      "mode": "forward",
+      "recorded_pred": "<score>+16.7%</score>",
+      "replay_pred": "<score>+16.7%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "2f55ad839b604ec3a4589b57f0332768",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "2f55ad839b604ec3a4589b57f0332768",
+      "step": 28,
+      "mode": "forward",
+      "recorded_pred": "<score>+25.0%</score>",
+      "replay_pred": "<score>+25.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "2f55ad839b604ec3a4589b57f0332768",
+      "step": 56,
+      "mode": "forward",
+      "recorded_pred": "<score>+40.0%</score>",
+      "replay_pred": "<score>+40.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "4025e55a9c8f440da4da83d7031055fd",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "4025e55a9c8f440da4da83d7031055fd",
+      "step": 19,
+      "mode": "forward",
+      "recorded_pred": "<score>+68.2%</score>",
+      "replay_pred": "<score>+68.2%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "4025e55a9c8f440da4da83d7031055fd",
+      "step": 38,
+      "mode": "forward",
+      "recorded_pred": "<score>+80.0%</score>",
+      "replay_pred": "<score>+80.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "530aee0bdc4a4ee891c3d1cea6b4d576",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "530aee0bdc4a4ee891c3d1cea6b4d576",
+      "step": 23,
+      "mode": "forward",
+      "recorded_pred": "<score>+36.4%</score>",
+      "replay_pred": "<score>+36.4%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "530aee0bdc4a4ee891c3d1cea6b4d576",
+      "step": 46,
+      "mode": "forward",
+      "recorded_pred": "<score>+75.0%</score>",
+      "replay_pred": "<score>+75.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "5817a80df76e4f17b89105d18b4642ad",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "5817a80df76e4f17b89105d18b4642ad",
+      "step": 22,
+      "mode": "forward",
+      "recorded_pred": "<score>+33.3%</score>",
+      "replay_pred": "<score>+33.3%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "5817a80df76e4f17b89105d18b4642ad",
+      "step": 43,
+      "mode": "forward",
+      "recorded_pred": "<score>+47.6%</score>",
+      "replay_pred": "<score>+47.6%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "6c9df3d80c9d4d32a0a803d5bb4a6fa5",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "6c9df3d80c9d4d32a0a803d5bb4a6fa5",
+      "step": 21,
+      "mode": "forward",
+      "recorded_pred": "<score>+33.3%</score>",
+      "replay_pred": "<score>+33.3%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "6c9df3d80c9d4d32a0a803d5bb4a6fa5",
+      "step": 42,
+      "mode": "forward",
+      "recorded_pred": "<score>+75.0%</score>",
+      "replay_pred": "<score>+75.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "7e0df3fa49b94c63adeb9b728f343fa6",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "7e0df3fa49b94c63adeb9b728f343fa6",
+      "step": 18,
+      "mode": "forward",
+      "recorded_pred": "<score>+25.0%</score>",
+      "replay_pred": "<score>+25.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "7e0df3fa49b94c63adeb9b728f343fa6",
+      "step": 36,
+      "mode": "forward",
+      "recorded_pred": "<score>+25.0%</score>",
+      "replay_pred": "<score>+25.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "9a948eb4d3b94c4380d6a60819f9c4cb",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "9a948eb4d3b94c4380d6a60819f9c4cb",
+      "step": 12,
+      "mode": "forward",
+      "recorded_pred": "<score>+25.0%</score>",
+      "replay_pred": "<score>+25.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "9a948eb4d3b94c4380d6a60819f9c4cb",
+      "step": 23,
+      "mode": "forward",
+      "recorded_pred": "<score>+25.0%</score>",
+      "replay_pred": "<score>+25.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "a006f928c5044ad2aed2f39f48a604c1",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "a006f928c5044ad2aed2f39f48a604c1",
+      "step": 20,
+      "mode": "forward",
+      "recorded_pred": "<score>+36.4%</score>",
+      "replay_pred": "<score>+36.4%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "a006f928c5044ad2aed2f39f48a604c1",
+      "step": 40,
+      "mode": "forward",
+      "recorded_pred": "<score>+50.0%</score>",
+      "replay_pred": "<score>+50.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "a12c542158fc47b590e2b7b87260059c",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "a12c542158fc47b590e2b7b87260059c",
+      "step": 24,
+      "mode": "forward",
+      "recorded_pred": "<score>+25.0%</score>",
+      "replay_pred": "<score>+25.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "a12c542158fc47b590e2b7b87260059c",
+      "step": 48,
+      "mode": "forward",
+      "recorded_pred": "<score>+16.7%</score>",
+      "replay_pred": "<score>+16.7%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "a71ca2173aca4adcaac7f0dba145da94",
+      "step": 0,
+      "mode": "forward",
+      "recorded_pred": "<score>0.0%</score>",
+      "replay_pred": "<score>0.0%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "a71ca2173aca4adcaac7f0dba145da94",
+      "step": 10,
+      "mode": "forward",
+      "recorded_pred": "<score>+4.2%</score>",
+      "replay_pred": "<score>+4.2%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    },
+    {
+      "session": "a71ca2173aca4adcaac7f0dba145da94",
+      "step": 20,
+      "mode": "forward",
+      "recorded_pred": "<score>+4.2%</score>",
+      "replay_pred": "<score>+4.2%</score>",
+      "exact_match": true,
+      "score_delta": 0.0
+    }
+  ],
+  "exact_matches": 36,
+  "total": 36,
+  "max_score_delta": 0.0,
+  "peak_allocated_gib": 17.072686195373535
+}

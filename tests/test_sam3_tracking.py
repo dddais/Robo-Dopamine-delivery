@@ -56,17 +56,30 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.tracker.step.call_count, 1)
         self.assertEqual(result['identity_policy'], 'initial_instance')
 
-    def test_ambiguous_first_frame_does_not_choose_an_instance(self):
-        self.detector.detect.return_value = [candidate(), candidate([16, 3, 24, 12], .89)]
+    def test_close_first_frame_scores_bind_highest_and_never_reselect(self):
+        lower = candidate([16, 3, 24, 12], .89)
+        # Deliberately unsorted so selecting the first returned row would fail.
+        self.detector.detect.return_value = [lower, candidate()]
         result = self.update()
-        self.assertEqual(result['selection_status'], 'ambiguous')
-        self.assertIsNone(result['selected'])
-        self.tracker.initialize.assert_not_called()
-        # Once the scene changes, a remaining pen must not resolve the initial
-        # ambiguity by becoming the only candidate.
-        self.detector.detect.return_value = [candidate([16, 3, 24, 12])]
-        self.assert_lost(self.update('remaining-pen'), 'ambiguous')
+        self.assertEqual(result['selection_status'], 'ok')
+        self.assertEqual(result['selected'], candidate())
+        self.tracker.initialize.assert_called_once_with(self.image, candidate()['bbox'])
+        self.detector.detect.return_value = [{**lower, 'score': 1.}]
+        self.assertEqual(self.update('next')['selected'], candidate())
+        self.tracker.step.return_value = None
+        self.assert_lost(self.update('lost'), 'empty_mask')
+        self.assert_lost(self.update('remaining-pen'), 'empty_mask')
         self.detector.detect.assert_called_once()
+        self.tracker.initialize.assert_called_once()
+
+    def test_equal_first_frame_scores_bind_first_returned_candidate_stably(self):
+        first = candidate([16, 3, 24, 12])
+        self.detector.detect.return_value = [first, candidate()]
+        result = self.update()
+        self.assertEqual(result['selected'], first)
+        self.assertEqual(result['selection_status'], 'ok')
+        self.assertEqual(self.update(), result)
+        self.tracker.initialize.assert_called_once_with(self.image, first['bbox'])
 
     def test_no_initial_detection_cannot_bind_a_later_scene(self):
         self.detector.detect.return_value = []
@@ -239,6 +252,13 @@ class ProtocolTests(unittest.TestCase):
 
     def next_frame(self):
         Image.new('RGB', (32, 24), 'red').save(self.path)
+
+    def test_http_initialization_returns_highest_close_scoring_candidate(self):
+        self.engine.detector.detect.return_value = [candidate([18, 3, 25, 12], .88), candidate()]
+        result = self.client.track(self.path, ['pen'], 'close-scores')
+        self.assertEqual(result['selected'], candidate())
+        self.assertEqual(result['selection_status'], 'ok')
+        self.assertEqual(result['image_sha256'], file_sha(self.path))
 
     def test_http_loss_publishes_empty_current_frame_and_new_task_can_bind(self):
         self.client.track(self.path, ['pen'], 'a')

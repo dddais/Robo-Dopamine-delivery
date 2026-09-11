@@ -43,7 +43,7 @@ BF16 的检测数值可能在阈值或多候选分差边界附近改变“是否
 
 1. Monitor 准备并固定任务参考三视角，启动本任务的后台采图/跟踪线程。
 2. 后台线程获取一组最新三视角快照。它与 GRM 线程独立运行，慢时不会补处理队列里的旧帧。
-3. 对 steering 配置中启用的 AFTER 视角（默认 `after_cam_high`）分别维护 tracker。首次文本检测只有明确候选时，才用 bbox 初始化单实例 tracker。
+3. 对 steering 配置中启用的 AFTER 视角（默认 `after_cam_high`）分别维护 tracker。首次文本检测在通过检测阈值的候选中选择得分最高的 bbox 初始化单实例 tracker；多个候选分数接近也照常绑定，同分时按检测器返回顺序取第一个。
 4. 后续新帧只运行同一个 tracker，不再周期性重检测或重新初始化。失跟后本任务持续输出空 bbox，只有开始新任务才能重新检测。更新期间，GRM 仍可读取上一组已完成且未过期的结果。
 5. 后台只保留**最新完整三视角 + 对应 bbox**。GRM 读取时固定该组文件；之后即使后台继续更新，也不会改变本轮 GRM 输入或 UI 预览。
 6. forward/incremental 共用本轮 AFTER 快照；双分支也共用此快照。steering 从该快照的定位结果构造 attention，baseline 保持无干预。BEFORE 视角如果配置了干预，仍按原来的图像检测路径处理。
@@ -54,7 +54,7 @@ BF16 的检测数值可能在阈值或多候选分差边界附近改变“是否
 ## 4. 实例锁定、丢失、内存与时效
 
 `left pen` 等关系描述只在任务首次跟踪图像中解析一次。绑定后，目标始终是当时选中的实例，不能在笔被拿起后重新把桌上剩下的笔当成 `left pen`。
-采用保守策略：**宁愿没有目标，也不在原任务内自动重选或找回。** 首帧无检测或有歧义同样保持空框；准备好场景后，需要结束当前任务并开始新任务才能再次绑定。
+首次绑定采用最高分候选，不再因前两个候选分差小而返回空框；同分时按检测器返回顺序取第一个。绑定后采用保守策略：**宁愿没有目标，也不在原任务内自动重选或找回。** 首帧完全没有通过检测阈值的候选时仍保持空框；准备好场景后，需要结束当前任务并开始新任务才能再次绑定。此选择规则用于 tracker 初始化；未启用 tracking 的逐帧检测模式仍保留原有的歧义判断。
 
 `configs/sam3_tracker.yaml` 中的参数：
 
@@ -70,7 +70,7 @@ BF16 的检测数值可能在阈值或多候选分差边界附近改变“是否
 
 HTTP `/tracking/update` 首次请求显式携带 `initialize: true`，后续全部为 `false`；只有首次请求允许创建会话。Monitor 客户端在发送前记录初始化尝试，首次网络请求失败也不会把后来的图像作为新的首帧。会话过期、关闭或 SAM3 重启后，旧任务的后续请求返回空框，不能重新创建会话；首次请求已经在服务端成功但响应丢失时，可以继续同一个已绑定的实例。不要在重试中再次发送 `initialize: true`。
 
-结果包含 `identity_policy: initial_instance`、`tracking_state: tracking/lost` 和 `loss_reason`。失跟结果是 `status: no_detection`、`selection_status: tracking_lost`、`selected: null`、`candidates: []`；首帧无检测/歧义保留 `no_detection` / `ambiguous`。常见原因有 `empty_mask`、`low_score`、`discontinuous_bbox`、`update_gap`、`inference_error`、`session_missing`。
+结果包含 `identity_policy: initial_instance`、`tracking_state: tracking/lost` 和 `loss_reason`。失跟结果是 `status: no_detection`、`selection_status: tracking_lost`、`selected: null`、`candidates: []`；首帧无检测保留 `selection_status: no_detection`，选中最高分候选时返回 `ok`。常见原因有 `empty_mask`、`low_score`、`discontinuous_bbox`、`update_gap`、`inference_error`、`session_missing`。
 
 这保证了应用层不会在重检测、重试或丢失后自动切换实例，并拦截明显的框跳变。视频模型自身在连续重叠区域内仍可能发生渐进漂移；仅凭 bbox 连续性无法证明物理身份，需要用连续真机视频进一步验证。
 

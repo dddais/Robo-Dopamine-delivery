@@ -10,7 +10,7 @@ robot_runtime_url: http://127.0.0.1:18767
 observation_timeout: 3.0
 no_backward: true
 # Set true (or pass --no-incremental) for forward only.
-no_incremental: false
+no_incremental: true
 # Wait after each completed inference round; inference itself takes additional time.
 interval: 0.1
 device: cuda:0

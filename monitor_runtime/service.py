@@ -238,6 +238,19 @@ def create_app(backend: DeterministicMonitorBackend | None = None) -> "FastAPI":
         except ValueError as exc:
             return _fail(str(exc), status=409)
 
+    @app.get("/monitors/{monitor_id}/records/{inference_step}/{camera}.png")
+    async def monitor_record_image(monitor_id: str, inference_step: int, camera: str, execution_id: str):
+        from fastapi.responses import Response
+        if not hasattr(backend, "record_image"):
+            return _fail("backend does not provide persisted scoring images", status=404)
+        try:
+            data = await run_in_threadpool(backend.record_image, monitor_id, execution_id, inference_step, camera)
+        except (KeyError, FileNotFoundError) as exc:
+            return _fail(str(exc), status=404)
+        except ValueError as exc:
+            return _fail(str(exc), status=409)
+        return Response(data, media_type="image/png", headers={"Cache-Control": "private, max-age=60"})
+
     @app.get("/monitors/frames/{frame_set_id}/{camera}.png")
     async def monitor_frame(frame_set_id: str, camera: str):
         from fastapi.responses import Response

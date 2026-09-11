@@ -314,6 +314,8 @@ class GRMMonitorBackend:
         # Keep registered journals readable after /monitors/stop. Recording
         # clients drain by byte cursor without polling/advancing inference.
         self._record_journals = {}
+        self._record_image_index = {}
+        self._record_image_lock = threading.Lock()
         # Only committed GRM inputs are published. Keep URLs usable after stop
         # so the operator can inspect the final score; files remain run artifacts.
         self._preview_frames = {}
@@ -713,6 +715,38 @@ class GRMMonitorBackend:
                 raise ValueError('tracking reference is not ready')
             state.inference_event.set()
             return self.status(payload)
+
+    def record_image(self, monitor_id, execution_id, inference_step, camera):
+        """Read a persisted scoring image even after preview-cache eviction."""
+        if type(inference_step) is not int or inference_step < 1 or camera not in CAMERA_KEYS:
+            raise ValueError('invalid inference step or camera')
+        with self._lock:
+            entry = self._record_journals.get(monitor_id)
+            if entry is None:
+                raise KeyError('unknown monitor journal')
+            execution, _, directory, _ = entry
+            if execution_id != execution:
+                raise ValueError('monitor journal does not belong to execution_id')
+        # Scanning and image reads do not hold the inference publication lock.
+        # Each appended JSONL line is indexed once, across all camera requests.
+        with self._record_image_lock:
+            cursor, frames = self._record_image_index.setdefault(monitor_id, [0, {}])
+            if inference_step not in frames:
+                with (directory / 'online_pred.jsonl').open('rb') as stream:
+                    stream.seek(cursor)
+                    while line := stream.readline():
+                        if not line.endswith(b'\n'):
+                            break
+                        row = json.loads(line)
+                        frames[row['inference_step']] = row['frames']
+                        self._record_image_index[monitor_id][0] = stream.tell()
+            path = frames.get(inference_step, {}).get(camera)
+            if path is None:
+                raise KeyError('unknown scoring image')
+        path = Path(path).resolve()
+        if not path.is_relative_to(directory.resolve()) or path.suffix != '.png':
+            raise ValueError('scoring image is outside its registered journal')
+        return path.read_bytes()
 
     def frame_image(self, frame_set_id, camera):
         # Resolve opaque registered IDs, never a caller-supplied filesystem path.

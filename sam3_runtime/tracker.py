@@ -133,6 +133,7 @@ class TrackingEngine:
         self.sessions = {}
         self.fingerprint = fingerprint({"detector": detector.fingerprint, "kind": "sam3_tracker_video_v2",
             "dtype": str(getattr(tracker, 'dtype', None)), "identity_policy": self.identity_policy,
+            "initial_selection": "highest_score",
             "max_gap_s": max_gap_s, "min_score": min_score, "match_iou": match_iou})
 
     def close(self, session_id):
@@ -155,7 +156,7 @@ class TrackingEngine:
         reason = state.loss_reason
         return {"candidates": [row] if row else [], "selected": row,
             "status": "ok" if row else "no_detection",
-            "selection_status": "ok" if row else reason if reason in {'ambiguous', 'no_detection'} else 'tracking_lost',
+            "selection_status": "ok" if row else 'no_detection' if reason == 'no_detection' else 'tracking_lost',
             "tracking_state": "tracking" if row else "lost", "loss_reason": reason,
             "identity_policy": self.identity_policy,
             "source": source, "score_type": "object_presence" if source == 'sam3_tracker' else "detection",
@@ -198,10 +199,12 @@ class TrackingEngine:
                 candidates = sorted(self.detector.detect(image, queries), key=lambda c: -c['score'])
                 timing['detect_ms'] = (time.monotonic()-tick)*1000
                 timing['detector'] = deepcopy(getattr(self.detector, 'last_timing', {}))
-                ambiguous = len(candidates) > 1 and candidates[1]['score'] >= candidates[0]['score']-.05
-                if not candidates or ambiguous:
-                    self._lose(state, 'ambiguous' if ambiguous else 'no_detection')
+                if not candidates:
+                    self._lose(state, 'no_detection')
                 else:
+                    # Ground once using the highest score even when candidates
+                    # are close. Stable sorting breaks ties by detector order.
+                    # This choice is never revisited after binding or loss.
                     row = candidates[0]
                     box = validate_bbox(row['bbox'], image.size)
                     if row['query'] not in queries or not math.isfinite(row['score']) or not 0 <= row['score'] <= 1:
