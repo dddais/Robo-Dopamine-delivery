@@ -39,6 +39,9 @@ def make_server(host, port, detector, tracker=None):
             self.send_json({"status": "ready", "model_fingerprint": detector.fingerprint,
                 "tracking_enabled": tracker is not None,
                 "tracking_identity_policy": tracker.identity_policy if tracker else None,
+                "tracking_config": {key: getattr(tracker, key) for key in (
+                    'mode', 'min_score', 'max_gap_s', 'match_iou', 'continuity_iou', 'redetect_interval_s')}
+                    if tracker else None,
                 "tracker_fingerprint": tracker.fingerprint if tracker else None})
 
         def do_POST(self):

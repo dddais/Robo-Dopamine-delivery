@@ -10,12 +10,16 @@ profile: false
 threshold: 0.3
 tracking:
   enabled: true
+  # locked: no text reacquisition. See sam3_tracker_hybrid.yaml for recovery.
+  mode: locked
   device: cuda:0
   dtype: bfloat16
   # Detect only on the first task frame. Any loss stays missing until a new task.
   max_gap_s: 2.0
-  min_score: 0.5
-  # Consecutive accepted boxes must overlap; reject abrupt instance jumps.
+  min_score: 0.1
+  # Hard consecutive-box guard; 0 disables it (fast/thin objects can have IoU=0).
+  continuity_iou: 0.0
+  # Detection-to-tracker association threshold, used only in hybrid mode.
   match_iou: 0.1
   memory_frames: 32
   session_ttl_s: 60.0

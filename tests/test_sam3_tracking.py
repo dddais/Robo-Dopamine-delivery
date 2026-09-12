@@ -1,4 +1,4 @@
-"""Instance locking, terminal loss, exact-frame handoff and bounded buffering."""
+"""Locked/hybrid tracking, exact-frame handoff and bounded buffering."""
 from copy import deepcopy
 from pathlib import Path
 import queue
@@ -130,6 +130,31 @@ class EngineTests(unittest.TestCase):
         self.assert_lost(self.update('original-pen'), 'discontinuous_bbox')
         self.tracker.step.assert_called_once()
 
+    def test_loss_diagnostics_survive_later_frames_without_becoming_current_box(self):
+        self.update()
+        rejected = candidate([18, 3, 25, 12], .99)
+        self.tracker.step.return_value = rejected
+        lost = self.update('triggering-frame')
+        later = self.update('later-frame')
+        self.assert_lost(later, 'discontinuous_bbox')
+        self.assertEqual(later['last_loss'], lost['last_loss'])
+        self.assertEqual(later['last_loss']['image_sha256'], 'triggering-frame')
+        self.assertEqual(later['last_loss']['bbox'], rejected['bbox'])
+        self.assertEqual(later['last_loss']['previous_bbox'], candidate()['bbox'])
+        self.assertEqual(later['last_loss']['score'], .99)
+        self.assertEqual(later['last_loss']['iou'], 0.)
+
+    def test_locked_mode_can_disable_overlap_guard_without_enabling_redetection(self):
+        self.engine = TrackingEngine(self.detector, self.tracker, continuity_iou=0.)
+        self.update()
+        moved = candidate([18, 3, 25, 12], .99)
+        self.tracker.step.return_value = moved
+        self.assertEqual(self.update('moved')['selected'], moved)
+        self.tracker.step.return_value = None
+        self.assert_lost(self.update('lost'), 'empty_mask')
+        self.assert_lost(self.update('retry'), 'empty_mask')
+        self.detector.detect.assert_called_once()
+
     def test_moving_original_instance_retains_query_and_memory(self):
         self.update()
         session = self.engine.sessions['a'].session
@@ -140,7 +165,7 @@ class EngineTests(unittest.TestCase):
         self.assertIs(self.engine.sessions['a'].session, session)
 
     def test_periodic_text_mismatch_cannot_reset_healthy_tracking(self):
-        # Old YAML remains loadable, but its redetection interval is retired.
+        # Old YAML remains loadable, but locked mode ignores its interval.
         self.engine = TrackingEngine(self.detector, self.tracker, redetect_interval_s=5.)
         self.update()
         for second in range(1, 12):
@@ -219,6 +244,151 @@ class EngineTests(unittest.TestCase):
         self.assertIs(model.get_image_features().fpn_position_embeddings, tensor)
 
 
+class HybridEngineTests(unittest.TestCase):
+    update = EngineTests.update
+    assert_lost = EngineTests.assert_lost
+
+    def setUp(self):
+        EngineTests.setUp(self)
+        self.engine = TrackingEngine(self.detector, self.tracker, mode='hybrid')
+
+    def test_hybrid_accepts_motion_without_overlap_by_default(self):
+        first = self.update()
+        moved = candidate([18, 3, 25, 12], .99)
+        self.tracker.step.return_value = moved
+        result = self.update('lifted')
+        self.assertEqual(result['selected'], moved)
+        self.assertEqual(result['identity_policy'], 'text_redetection')
+        self.assertEqual(result['tracking_mode'], 'hybrid')
+        self.assertEqual(result['source'], 'sam3_tracker')
+        self.assertEqual(result['initialization_count'], first['initialization_count'])
+        self.detector.detect.assert_called_once()
+
+    def test_periodic_detection_matches_current_frame_not_highest_score_or_old_box(self):
+        self.update()
+        moved = candidate([18, 3, 25, 12], .6)
+        self.tracker.step.return_value = moved
+        self.engine.sessions['a'].detected_at = 90.
+        self.detector.detect.return_value = [candidate(score=.99), moved]
+        result = self.update('periodic')
+        self.assertEqual(result['selected'], moved)
+        self.assertEqual(result['detection_reason'], 'periodic')
+        self.assertEqual(result['detection_status'], 'matched')
+        self.assertEqual(result['source'], 'sam3_detection')
+        self.assertEqual(result['initialization_count'], 2)
+        self.assertEqual(result['tracker_frame_index'], 0)
+
+    def test_periodic_mismatch_preserves_healthy_track_and_does_not_retry_every_frame(self):
+        self.update()
+        session = self.engine.sessions['a'].session
+        self.detector.detect.return_value = [candidate([18, 3, 25, 12], .99)]
+        self.engine.sessions['a'].detected_at = 90.
+        result = self.update('periodic')
+        self.assertEqual(result['selected'], candidate())
+        self.assertEqual(result['detection_status'], 'no_match_kept_tracking')
+        self.assertEqual(result['source'], 'sam3_tracker')
+        self.assertIs(self.engine.sessions['a'].session, session)
+        self.assertEqual(self.update('next')['selected'], candidate())
+        self.assertEqual(self.detector.detect.call_count, 2)
+        self.tracker.initialize.assert_called_once()
+
+    def test_periodic_empty_detection_keeps_video_result(self):
+        self.update()
+        self.detector.detect.return_value = []
+        self.engine.sessions['a'].detected_at = 90.
+        result = self.update('periodic')
+        self.assertEqual(result['selected'], candidate())
+        self.assertIsNone(result['loss_reason'])
+        self.assertEqual(result['detection_status'], 'no_match_kept_tracking')
+
+    def test_loss_redetects_highest_score_and_may_bind_another_instance(self):
+        self.update()
+        self.tracker.step.return_value = None
+        other = candidate([18, 3, 25, 12], .99)
+        self.detector.detect.return_value = [candidate(score=.98), other]
+        result = self.update('lost')
+        self.assertEqual(result['selected'], other)
+        self.assertEqual(result['detection_reason'], 'empty_mask')
+        self.assertEqual(result['source'], 'sam3_detection')
+        self.assertIsNone(result['loss_reason'])
+        self.assertEqual(result['last_loss']['reason'], 'empty_mask')
+        self.assertEqual(result['last_loss']['image_sha256'], 'lost')
+        self.assertEqual(result['initialization_count'], 2)
+        # A retry of the same completed frame must not reinitialize yet again.
+        self.assertEqual(self.update('lost'), result)
+        self.assertEqual(self.detector.detect.call_count, 2)
+
+    def test_no_detection_after_loss_retries_on_next_frame_without_old_bbox(self):
+        self.update()
+        self.tracker.step.return_value = None
+        self.detector.detect.return_value = []
+        lost = self.update('lost')
+        self.assert_lost(lost, 'empty_mask')
+        self.assertEqual(lost['detection_status'], 'no_detection')
+        self.detector.detect.return_value = [candidate()]
+        self.assertEqual(self.update('reappeared')['selected'], candidate())
+        self.assertEqual(self.tracker.initialize.call_count, 2)
+        self.tracker.step.assert_called_once()
+
+    def test_no_initial_detection_can_retry_in_hybrid_mode(self):
+        self.detector.detect.return_value = []
+        self.assert_lost(self.update(), 'no_detection')
+        self.detector.detect.return_value = [candidate()]
+        self.assertEqual(self.update('found')['selected'], candidate())
+
+    def test_low_score_triggers_same_frame_detection(self):
+        self.update()
+        self.tracker.step.return_value = candidate(score=.49)
+        result = self.update('low')
+        self.assertEqual(result['detection_reason'], 'low_score')
+        self.assertEqual(result['last_loss']['score'], .49)
+        self.assertEqual(result['source'], 'sam3_detection')
+
+    def test_optional_overlap_guard_can_trigger_hybrid_recovery(self):
+        self.engine = TrackingEngine(self.detector, self.tracker, mode='hybrid', continuity_iou=.1)
+        self.update()
+        self.tracker.step.return_value = candidate([18, 3, 25, 12], .99)
+        result = self.update('jump')
+        self.assertEqual(result['detection_reason'], 'discontinuous_bbox')
+        self.assertEqual(result['source'], 'sam3_detection')
+
+    def test_gap_drops_old_state_and_detects_current_frame(self):
+        self.update()
+        self.now.return_value = 104.
+        result = self.update('first')
+        self.assertEqual(result['detection_reason'], 'update_gap')
+        self.assertEqual(result['last_loss']['gap_s'], 4.)
+        self.assertEqual(result['initialization_count'], 2)
+        self.tracker.step.assert_not_called()
+
+    def test_partial_inference_error_can_reinitialize_only_on_next_update(self):
+        self.update()
+        self.tracker.step.side_effect = RuntimeError('GPU failed')
+        with self.assertRaises(RuntimeError):
+            self.update('failed')
+        self.assertIsNone(self.engine.sessions['a'].session)
+        self.tracker.step.side_effect = None
+        result = self.update('retry')
+        self.assertEqual(result['detection_reason'], 'inference_error')
+        self.assertEqual(result['last_loss']['image_sha256'], 'failed')
+        self.assertEqual(result['initialization_count'], 2)
+
+    def test_missing_sessions_still_require_explicit_first_task_request(self):
+        self.update()
+        self.now.return_value = 200.
+        self.assert_lost(self.update('expired'), 'session_missing')
+        self.assert_lost(self.engine.update('unknown', self.image, ['pen'], 'frame'), 'session_missing')
+        self.detector.detect.assert_called_once()
+
+    def test_configuration_validation(self):
+        for options in ({'mode': 'typo'}, {'mode': None}, {'mode': True},
+                        {'continuity_iou': -.1}, {'continuity_iou': 1.1}, {'continuity_iou': True},
+                        {'continuity_iou': float('nan')}, {'redetect_interval_s': 0},
+                        {'redetect_interval_s': float('inf')}, {'redetect_interval_s': True}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                TrackingEngine(self.detector, self.tracker, **options)
+
+
 class ProtocolTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -259,6 +429,34 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(result['selected'], candidate())
         self.assertEqual(result['selection_status'], 'ok')
         self.assertEqual(result['image_sha256'], file_sha(self.path))
+
+    def test_http_hybrid_reacquisition_and_health_match_same_frame(self):
+        self.engine.__init__(self.engine.detector, self.engine.tracker, mode='hybrid')
+        self.client.track(self.path, ['pen'], 'a')
+        other = candidate([18, 3, 25, 12], .99)
+        self.engine.tracker.step = Mock(return_value=None)
+        self.engine.detector.detect.return_value = [other]
+        self.next_frame()
+        result = self.client.track(self.path, ['pen'], 'a')
+        self.assertEqual(result['identity_policy'], 'text_redetection')
+        self.assertEqual(result['selected'], other)
+        self.assertEqual(result['image_sha256'], file_sha(self.path))
+        self.assertEqual(result['last_loss']['image_sha256'], file_sha(self.path))
+        health = self.client._request('/health')
+        self.assertEqual(health['tracking_identity_policy'], 'text_redetection')
+        self.assertEqual(health['tracking_config']['mode'], 'hybrid')
+        self.assertEqual(health['tracking_config']['continuity_iou'], 0.)
+
+    def test_client_rejects_policy_change_mid_task(self):
+        self.client.track(self.path, ['pen'], 'a')
+        request = self.client._request
+        def changed_policy(route, payload):
+            result = request(route, payload)
+            result['identity_policy'] = 'text_redetection'
+            return result
+        with patch.object(self.client, '_request', side_effect=changed_policy):
+            with self.assertRaisesRegex(AlignmentError, 'identity policy changed'):
+                self.client.track(self.path, ['pen'], 'a')
 
     def test_http_loss_publishes_empty_current_frame_and_new_task_can_bind(self):
         self.client.track(self.path, ['pen'], 'a')
@@ -323,7 +521,7 @@ class ProtocolTests(unittest.TestCase):
             result.pop('identity_policy')
             return result
         with patch.object(self.client, '_request', side_effect=old_server):
-            with self.assertRaisesRegex(AlignmentError, 'initial-instance locking'):
+            with self.assertRaisesRegex(AlignmentError, 'supported identity policy'):
                 self.client.track(self.path, ['pen'], 'a')
 
 

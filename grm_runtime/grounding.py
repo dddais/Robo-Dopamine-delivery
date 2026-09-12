@@ -60,6 +60,7 @@ class GroundingClient:
         # for this client's lifetime, even after errors or close, so a retry can
         # never silently initialize from a later scene.
         self._tracking_started = set()
+        self._tracking_policies = {}
         self._lock = threading.Lock()
 
     def _request(self, route, payload=None):
@@ -127,9 +128,14 @@ class GroundingClient:
             'image_sha256': sha, 'queries': queries, 'image_png_base64': base64.b64encode(data).decode()})
         if result.get('session_id') != session_id or result.get('request_id') != request_id:
             raise AlignmentError('Tracker response belongs to a different session/request')
-        if result.get('identity_policy') != 'initial_instance':
-            raise AlignmentError('SAM3 tracker lacks initial-instance locking; restart SAM3 with the updated code')
+        policy = result.get('identity_policy')
+        if policy not in {'initial_instance', 'text_redetection'}:
+            raise AlignmentError('SAM3 tracker lacks a supported identity policy; restart SAM3 with the updated code')
         validate_grounding_result(result, sha, size, queries)
+        with self._lock:
+            if self._tracking_policies.get(session_id, policy) != policy:
+                raise AlignmentError('Tracker identity policy changed during the task; start a new task')
+            self._tracking_policies[session_id] = policy
         return result
 
     def close_track(self, session_id):

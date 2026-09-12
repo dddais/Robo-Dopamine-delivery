@@ -1,0 +1,26 @@
+# Video tracking + text redetection. Reacquisition may select another instance.
+# CUDA_VISIBLE_DEVICES=3 maps both cuda:0 devices below to physical GPU 3.
+host: 127.0.0.1
+port: 8878
+model_path: /home/dais/workspace/model/sam3
+device: cuda:0
+dtype: bfloat16
+bbox_only: true
+num_threads: 4
+profile: false
+threshold: 0.3
+tracking:
+  enabled: true
+  mode: hybrid
+  device: cuda:0
+  dtype: bfloat16
+  redetect_interval_s: 5.0
+  max_gap_s: 2.0
+  min_score: 0.1
+  # Do not reject a valid video mask solely for rapid movement/low box overlap.
+  continuity_iou: 0.0
+  # Periodic detections must overlap the CURRENT tracked box to replace it.
+  match_iou: 0.1
+  memory_frames: 32
+  session_ttl_s: 60.0
+  max_sessions: 8
